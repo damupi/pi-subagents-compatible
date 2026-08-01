@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.pi/extensions/pi-subagent/overrides.schema.json",
+  "title": "Pi subagent replacement overrides",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "agentOverrides": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/agentOverride"
+      }
+    }
+  },
+  "required": ["agentOverrides"],
+  "$defs": {
+    "turnBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxTurns": { "type": "integer", "minimum": 1 },
+        "graceTurns": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["maxTurns"]
+    },
+    "agentOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "model": { "type": "string", "minLength": 1 },
+        "fallbackModels": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "thinking": { "type": "string", "minLength": 1 },
+        "tools": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "defaultContext": { "enum": ["fresh", "fork"] },
+        "timeoutMs": { "type": "integer", "minimum": 1 },
+        "turnBudget": { "$ref": "#/$defs/turnBudget" },
+        "maxSubagentDepth": { "type": "integer", "minimum": 1 },
+        "systemPrompt": { "type": "string" },
+        "systemPromptMode": { "enum": ["append", "replace"] },
+        "description": { "type": "string" },
+        "extensions": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "subagentOnlyExtensions": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "skills": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "inheritProjectContext": { "type": "boolean" },
+        "inheritSkills": { "type": "boolean" },
+        "acceptance": {
+          "oneOf": [
+            { "type": "string" },
+            {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            }
+          ]
+        },
+        "acceptanceRole": { "type": "string" },
+        "completionGuard": { "type": "boolean" },
+        "interactive": { "type": "boolean" },
+        "memory": { "type": "string" },
+        "output": { "type": "string" },
+        "defaultReads": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "defaultProgress": { "type": "string" },
+        "toolBudget": { "type": "integer", "minimum": 1 },
+        "async": { "type": "boolean" },
+        "disabled": { "type": "boolean" }
+      }
+    }
+  }
+}

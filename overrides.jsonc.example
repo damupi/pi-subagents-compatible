@@ -1,0 +1,31 @@
+{
+  "$schema": "./overrides.schema.json",
+  "agentOverrides": {
+    "google-analyst": {
+      "model": "anthropic/claude-sonnet-4",
+      "tools": ["read", "bash", "write", "web_search", "mcp"],
+      "defaultContext": "fork",
+      "maxSubagentDepth": 1
+    },
+    "gtm-admin": {
+      "model": "anthropic/claude-sonnet-4",
+      "tools": ["read", "bash", "write", "edit", "mcp"],
+      "timeoutMs": 1800000,
+      "defaultContext": "fork",
+      "maxSubagentDepth": 1
+    },
+    "maribel": {
+      "model": "anthropic/claude-sonnet-4",
+      "tools": ["read", "bash", "mcp"],
+      "defaultContext": "fork",
+      "maxSubagentDepth": 1
+    },
+    "researcher": {
+      "model": "openai-codex/gpt-5.4",
+      "tools": ["read", "write", "web_search", "fetch_content", "get_search_content", "mcp"],
+      "defaultContext": "fresh",
+      "timeoutMs": 1800000,
+      "maxSubagentDepth": 1
+    }
+  }
+}
