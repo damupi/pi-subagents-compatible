@@ -65,6 +65,8 @@ Current limitation:
 index.ts
 README.md
 LICENSE
+CHANGELOG.md
+package.json
 .gitignore
 overrides.schema.json
 overrides.jsonc.example
@@ -76,6 +78,12 @@ Local/private runtime file:
 - `overrides.jsonc` — your real local config (gitignored)
 
 ## Install / load
+
+### Install from GitHub
+
+```bash
+pi install git:github.com/damupi/pi-subagents-compatible
+```
 
 ### Quick local test
 
@@ -95,6 +103,10 @@ Then run:
 ```text
 /reload
 ```
+
+### Package metadata
+
+This repo includes a `package.json` with a `pi.extensions` manifest so it can be used as a Pi package as well as copied directly.
 
 ## Configuration
 
