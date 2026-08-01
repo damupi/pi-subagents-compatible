@@ -301,14 +301,16 @@ This repo now avoids machine-specific paths in the code and exposes environment-
 
 ## Attribution
 
-This project is a Pi-native replacement inspired by the original `pi-subagents` package.
+This extension is an independent, compatible replacement inspired by the original [`pi-subagents`](https://pi.dev/packages/pi-subagents) project.
 
-Upstream reference:
+Original upstream references:
 
-- original project: `pi-subagents`
-- local reference used during migration and behavior study: `~/.pi/agent/npm/node_modules/pi-subagents`
+- package: https://pi.dev/packages/pi-subagents
+- source: https://github.com/nicobailon/pi-subagents
 
-This extension is a separate implementation built for Pi-native use and Claude-compatible operator workflow.
+It is **not** an official continuation or endorsed fork.
+
+This repo is a separate implementation built for Pi-native use and Claude-compatible operator workflow.
 
 ## License
 
