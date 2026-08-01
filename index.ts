@@ -3,6 +3,7 @@ import { Type } from "typebox";
 import { Key, Text, isKeyRelease, matchesKey, truncateToWidth, type EditorComponent } from "@earendil-works/pi-tui";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
@@ -128,7 +129,7 @@ type ChildPlan = {
 };
 
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
-const SOURCE_AGENT_DIR = resolveConfiguredPath(process.env.PI_SUBAGENT_AGENT_DIR, join(EXTENSION_DIR, "..", "..", "agents"));
+const ENV_AGENT_DIR = process.env.PI_SUBAGENT_AGENT_DIR?.trim() ? resolve(process.env.PI_SUBAGENT_AGENT_DIR.trim()) : undefined;
 const CONFIG_PATH = resolveConfiguredPath(process.env.PI_SUBAGENT_CONFIG_PATH, join(EXTENSION_DIR, "overrides.jsonc"));
 const SCHEMA_PATH = join(EXTENSION_DIR, "overrides.schema.json");
 const RUNS_DIR = resolveConfiguredPath(process.env.PI_SUBAGENT_RUNS_DIR, join(EXTENSION_DIR, "runs"));
@@ -157,9 +158,11 @@ export default function (pi: ExtensionAPI) {
   let inspectorScroll = 0;
   let selectedKey = "main";
   let currentSessionId: string | undefined;
+  let currentProjectCwd = process.cwd();
 
-  function refresh() {
-    agents = loadAgents();
+  function refresh(cwd?: string) {
+    if (cwd) currentProjectCwd = cwd;
+    agents = loadAgents(currentProjectCwd);
     return agents;
   }
 
@@ -387,6 +390,7 @@ export default function (pi: ExtensionAPI) {
     cleanupUi();
     uiCtx = ctx;
     currentSessionId = getSessionId(ctx) || undefined;
+    currentProjectCwd = ctx.cwd || process.cwd();
     reconcileStoredRuns();
     if (ctx.hasUI && typeof ctx.ui.onTerminalInput === "function") {
       uiInputUnsubscribe = ctx.ui.onTerminalInput((data: string) => handleTerminalKey(data));
@@ -396,7 +400,7 @@ export default function (pi: ExtensionAPI) {
       refreshUi();
     }, 1000);
     uiRefreshTimer.unref?.();
-    refresh();
+    refresh(ctx.cwd);
     deliverPendingNotifications(pi, currentSessionId);
     refreshUi(ctx);
   });
@@ -411,18 +415,18 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("subagents", {
     description: "List shared subagents",
     handler: async (_args, ctx) => {
-      refresh();
+      refresh(ctx.cwd);
       refreshUi(ctx);
-      ctx.ui.notify(renderAgentList(agents).join("\n"), "info");
+      ctx.ui.notify(renderAgentList(agents, currentProjectCwd).join("\n"), "info");
     },
   });
 
   pi.registerCommand("subagents-reload", {
     description: "Reload shared subagent registry",
     handler: async (_args, ctx) => {
-      refresh();
+      refresh(ctx.cwd);
       refreshUi(ctx);
-      ctx.ui.notify(`reloaded ${agents.length} subagents from ${SOURCE_AGENT_DIR}`, "info");
+      ctx.ui.notify(`reloaded ${agents.length} subagents from ${describeAgentSources(currentProjectCwd)}`, "info");
     },
   });
 
@@ -484,20 +488,20 @@ export default function (pi: ExtensionAPI) {
       };
 
       if (input.action === "reload") {
-        refresh();
+        refresh(ctx.cwd);
         refreshUi(ctx);
         return {
           content: [{ type: "text", text: `Reloaded ${agents.length} subagents.` }],
-          details: { action: "reload", count: agents.length, sourceAgentDir: SOURCE_AGENT_DIR, configPath: CONFIG_PATH },
+          details: { action: "reload", count: agents.length, agentSources: getAgentSourceDirs(currentProjectCwd), configPath: CONFIG_PATH },
         };
       }
 
       if (input.action === "list" || (!input.action && !input.agent && !input.tasks?.length && !input.chain?.length)) {
-        refresh();
+        refresh(ctx.cwd);
         refreshUi(ctx);
         return {
-          content: [{ type: "text", text: renderAgentList(agents).join("\n") }],
-          details: { action: "list", count: agents.length, agents: agents.map(summarizeAgent), sourceAgentDir: SOURCE_AGENT_DIR, configPath: CONFIG_PATH },
+          content: [{ type: "text", text: renderAgentList(agents, currentProjectCwd).join("\n") }],
+          details: { action: "list", count: agents.length, agents: agents.map(summarizeAgent), agentSources: getAgentSourceDirs(currentProjectCwd), configPath: CONFIG_PATH },
         };
       }
 
@@ -520,7 +524,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      refresh();
+      refresh(ctx.cwd);
       const currentDepth = Number.parseInt(process.env[DEPTH_ENV] || "0", 10) || 0;
       const parentSessionId = getSessionId(ctx) || undefined;
       const parentSessionFile = getSessionFile(ctx) || undefined;
@@ -729,35 +733,36 @@ async function runChainForeground(
   return { mode: "foreground", steps: results };
 }
 
-function loadAgents(): AgentDef[] {
+function loadAgents(projectCwd = process.cwd()): AgentDef[] {
   const overrides = loadOverrides();
-  const agents: AgentDef[] = [];
-  if (!existsSync(SOURCE_AGENT_DIR)) return agents;
+  const resolved = new Map<string, AgentDef>();
 
-  for (const entry of readdirSync(SOURCE_AGENT_DIR)) {
-    if (!entry.endsWith(".md")) continue;
-    const filePath = join(SOURCE_AGENT_DIR, entry);
-    const parsed = parseMarkdownAgent(readFileSync(filePath, "utf8"));
-    if (!parsed) continue;
-    const name = asNonEmptyString(parsed.frontmatter.name);
-    if (!name) continue;
-    const packageName = asNonEmptyString(parsed.frontmatter.package);
-    const runtimeName = packageName ? `${packageName}.${name}` : name;
-    const override = normalizeOverride(overrides[runtimeName] ?? overrides[name] ?? {});
-    if (override.disabled === true) continue;
-    agents.push({
-      name,
-      runtimeName,
-      packageName,
-      description: override.description || asNonEmptyString(parsed.frontmatter.description) || "",
-      sourcePath: filePath,
-      systemPrompt: typeof override.systemPrompt === "string" ? override.systemPrompt : parsed.body,
-      override,
-    });
+  for (const dir of getAgentSourceDirs(projectCwd)) {
+    if (!existsSync(dir)) continue;
+    for (const entry of readdirSync(dir)) {
+      if (!entry.endsWith(".md")) continue;
+      const filePath = join(dir, entry);
+      const parsed = parseMarkdownAgent(readFileSync(filePath, "utf8"));
+      if (!parsed) continue;
+      const name = asNonEmptyString(parsed.frontmatter.name);
+      if (!name) continue;
+      const packageName = asNonEmptyString(parsed.frontmatter.package);
+      const runtimeName = packageName ? `${packageName}.${name}` : name;
+      const override = normalizeOverride(overrides[runtimeName] ?? overrides[name] ?? {});
+      if (override.disabled === true) continue;
+      resolved.set(runtimeName, {
+        name,
+        runtimeName,
+        packageName,
+        description: override.description || asNonEmptyString(parsed.frontmatter.description) || "",
+        sourcePath: filePath,
+        systemPrompt: typeof override.systemPrompt === "string" ? override.systemPrompt : parsed.body,
+        override,
+      });
+    }
   }
 
-  agents.sort((a, b) => a.runtimeName.localeCompare(b.runtimeName));
-  return agents;
+  return Array.from(resolved.values()).sort((a, b) => a.runtimeName.localeCompare(b.runtimeName));
 }
 
 function loadOverrides(): Record<string, JsonObject> {
@@ -800,18 +805,20 @@ function normalizeOverride(input: JsonObject): OverrideConfig {
   };
 }
 
-function renderAgentList(agents: AgentDef[]): string[] {
+function renderAgentList(agents: AgentDef[], projectCwd = process.cwd()): string[] {
+  const sourceDirs = getAgentSourceDirs(projectCwd);
   if (agents.length === 0) {
     return [
       "No subagents found.",
-      `agents dir: ${SOURCE_AGENT_DIR}`,
+      `agent sources: ${sourceDirs.join(" | ")}`,
       `config: ${CONFIG_PATH}`,
       `schema: ${SCHEMA_PATH}`,
     ];
   }
 
   const lines = [
-    `agents dir: ${SOURCE_AGENT_DIR}`,
+    `agent sources: ${sourceDirs.join(" | ")}`,
+    `precedence: later sources win (project overrides user)`,
     `config: ${CONFIG_PATH}`,
     `schema: ${SCHEMA_PATH}`,
     `runs dir: ${RUNS_DIR}`,
@@ -1736,6 +1743,22 @@ function parseYamlScalar(raw: string): Json {
 
 function resolveConfiguredPath(value: string | undefined, fallback: string): string {
   return value && value.trim() ? resolve(value.trim()) : fallback;
+}
+
+function expandHomePath(value: string): string {
+  return value === "~" ? homedir() : value.startsWith("~/") ? join(homedir(), value.slice(2)) : value;
+}
+
+function getAgentSourceDirs(projectCwd = process.cwd()): string[] {
+  const userDir = resolve(expandHomePath("~/.pi/agent/agents"));
+  const projectDir = resolve(projectCwd, ".pi", "agents");
+  const dirs = [userDir, projectDir];
+  if (ENV_AGENT_DIR) dirs.push(ENV_AGENT_DIR);
+  return Array.from(new Set(dirs));
+}
+
+function describeAgentSources(projectCwd = process.cwd()): string {
+  return getAgentSourceDirs(projectCwd).join(" -> ");
 }
 
 function nextMeaningfulLine(lines: string[], start: number): number {

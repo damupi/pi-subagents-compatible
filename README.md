@@ -112,20 +112,30 @@ This repo includes a `package.json` with a `pi.extensions` manifest so it can be
 
 This extension uses:
 
-- a shared agents directory
+- layered agent directories with scope precedence
 - a local overrides config
 - a run-artifacts directory
 
-By default it resolves these relative to the extension location, but for public-safe use you can override them with environment variables:
+Agent resolution precedence is:
 
-- `PI_SUBAGENT_AGENT_DIR`
+1. user scope: `~/.pi/agent/agents`
+2. project scope: `./.pi/agents`
+3. optional env override: `PI_SUBAGENT_AGENT_DIR`
+
+If the same agent exists in both user and project scope, the **project-scope agent wins**.
+
+For example, if you have `researcher` in both places, `./.pi/agents/researcher.md` is used.
+
+Other configurable paths can be overridden with environment variables:
+
+- `PI_SUBAGENT_AGENT_DIR` — optional highest-precedence extra agent directory
 - `PI_SUBAGENT_CONFIG_PATH`
 - `PI_SUBAGENT_RUNS_DIR`
 
 ### Example
 
 ```bash
-export PI_SUBAGENT_AGENT_DIR="$HOME/.pi/agent/agents"
+export PI_SUBAGENT_AGENT_DIR="$HOME/.config/pi-subagent/shared-agents"
 export PI_SUBAGENT_CONFIG_PATH="$HOME/.pi/agent/extensions/pi-subagent/overrides.jsonc"
 export PI_SUBAGENT_RUNS_DIR="$HOME/.pi/agent/extensions/pi-subagent/runs"
 ```
