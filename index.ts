@@ -15,6 +15,45 @@ type SystemPromptMode = "append" | "replace";
 type RunKind = "single" | "parallel" | "chain";
 type DeliveryState = "undelivered" | "delivered";
 type AsyncRunStatus = "queued" | "running" | "completed" | "failed" | "stopped" | "timed_out" | "spawn_error" | "orphaned";
+type FleetEntryStatus = AsyncRunStatus;
+type FleetEntryKind = "foreground" | "async";
+
+type FleetEntry = {
+  key: string;
+  runId: string;
+  kind: FleetEntryKind;
+  agent: string;
+  task: string;
+  status: FleetEntryStatus;
+  cwd: string;
+  contextMode?: ContextMode;
+  startedAtMs: number;
+  updatedAtMs: number;
+  finishedAtMs?: number;
+  model?: string;
+  stepLabel?: string;
+  groupId?: string;
+  currentTool?: string;
+  currentToolArgs?: string;
+  currentPath?: string;
+  turnCount?: number;
+  toolCount?: number;
+  tokens?: number;
+  outputPreview?: string;
+  outputPath?: string;
+  stderrPath?: string;
+  artifactPath?: string;
+  childSessionFile?: string;
+};
+
+type ChildActivity = {
+  textDelta?: string;
+  toolName?: string;
+  toolArgs?: string;
+  path?: string;
+  turnEnded?: boolean;
+  tokens?: number;
+};
 
 type OverrideConfig = {
   model?: string;
@@ -135,8 +174,15 @@ const SCHEMA_PATH = join(EXTENSION_DIR, "overrides.schema.json");
 const RUNS_DIR = resolveConfiguredPath(process.env.PI_SUBAGENT_RUNS_DIR, join(EXTENSION_DIR, "runs"));
 const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
 const FORK_CONTEXT_LINES = 16;
-const COMPLETED_UI_GRACE_MS = 4000;
+const COMPLETED_UI_GRACE_MS = 15_000;
+const FLEET_REFRESH_MS = 500;
+const MAX_FLEET_ROWS = 5;
+const MAX_OUTPUT_PREVIEW_CHARS = 2000;
+const FLEET_WIDGET_KEY = "pi-subagent-fleet";
+const LEGACY_WIDGET_KEY = "pi-subagent-runs";
+const USE_LEGACY_FOOTER = false;
 
+const fleetEntries = new Map<string, FleetEntry>();
 let refreshExternalUi: () => void = () => {};
 
 export default function (pi: ExtensionAPI) {
@@ -170,15 +216,16 @@ export default function (pi: ExtensionAPI) {
     const target = ctx || uiCtx;
     if (!target) return;
     const runs = listRunRecords();
-    const running = runs.filter((run) => run.status === "running" || run.status === "queued").length;
+    const fleet = visibleFleetEntries();
+    const running = fleet.filter((run) => run.status === "running" || run.status === "queued").length;
     const failed = runs.filter((run) => run.status === "failed" || run.status === "spawn_error" || run.status === "timed_out").length;
     const text = [`subagents:${agents.length}`, `runs:${running}`];
     if (failed > 0) text.push(`issues:${failed}`);
     target.ui.setStatus("pi-subagent", text.join(" "));
   }
 
-  function visibleUiRuns() {
-    return getVisibleUiRecords(listRunRecords());
+  function visibleFleetEntries() {
+    return getVisibleFleetEntries(listRunRecords());
   }
 
   function updateUiWidget(ctx?: any) {
@@ -186,34 +233,34 @@ export default function (pi: ExtensionAPI) {
     if (!target) return;
 
     if (!widgetRegistered) {
-      target.ui.setWidget("pi-subagent-runs", (tui: any, theme: any) => {
+      target.ui.setWidget(FLEET_WIDGET_KEY, (tui: any, theme: any) => {
         widgetTui = tui;
         return {
           render(width: number): string[] {
-            const records = visibleUiRuns();
-            if (records.length === 0) return [];
+            const entries = visibleFleetEntries();
+            if (entries.length === 0) return [];
 
             if (inspectorOpen) {
-              const selected = records.find((record) => record.runId === selectedKey);
+              const selected = entries.find((entry) => entry.key === selectedKey);
               if (!selected) return [];
-              return renderInspector(selected, width, theme, inspectorScroll);
+              return renderFleetInspector(selected, width, theme, inspectorScroll);
             }
 
-            const roster = ["main", ...records.map((record) => record.runId)];
+            const roster = ["main", ...entries.map((entry) => entry.key)];
             if (!roster.includes(selectedKey)) selectedKey = "main";
             const selectedIndex = Math.max(0, roster.indexOf(selectedKey));
             const hint = selectorActive
               ? "↑↓/jk select · enter inspect · pgup/pgdn scroll · esc back"
-              : "↓ activate subagents";
+              : "↓ for subagents";
             const lines = [truncateToWidth(`  ${theme.fg("dim", hint)}`, width), ""];
             lines.push(renderRosterLine(width, theme, 0, selectedIndex, "main", "main"));
-            for (let index = 0; index < records.length; index += 1) {
-              const record = records[index]!;
-              const elapsed = formatElapsed(record);
-              const status = colorStatus(theme, record.status);
-              const summary = record.completionSummary || latestRecordLine(record) || record.task;
-              lines.push(renderRosterLine(width, theme, index + 1, selectedIndex, record.runId, `${record.agent} · ${status} · ${elapsed}`));
-              lines.push(truncateToWidth(`    ${theme.fg("dim", truncateLine(summary.replace(/\s+/g, " "), Math.max(12, width - 6)))}`, width));
+            for (let index = 0; index < Math.min(entries.length, MAX_FLEET_ROWS); index += 1) {
+              const entry = entries[index]!;
+              lines.push(renderRosterLine(width, theme, index + 1, selectedIndex, entry.key, formatFleetHeadline(entry, theme)));
+              lines.push(truncateToWidth(`    ${theme.fg("dim", formatFleetActivity(entry, width - 6))}`, width));
+            }
+            if (entries.length > MAX_FLEET_ROWS) {
+              lines.push(truncateToWidth(`    ${theme.fg("dim", `+${entries.length - MAX_FLEET_ROWS} more subagents`)}`, width));
             }
             return lines;
           },
@@ -234,38 +281,15 @@ export default function (pi: ExtensionAPI) {
   function setFooter(ctx?: any) {
     const target = ctx || uiCtx;
     if (!target) return;
-
-    const runs = visibleUiRuns();
-    if (runs.length === 0) {
-      if (footerRegistered) {
-        target.ui.setFooter(undefined);
-        footerRegistered = false;
-      }
-      return;
+    if (footerRegistered) {
+      target.ui.setFooter(undefined);
+      footerRegistered = false;
     }
-
-    if (!footerRegistered) {
-      target.ui.setFooter((_tui: any, theme: any) => ({
-        render(width: number): string[] {
-          const visibleRuns = visibleUiRuns();
-          const running = visibleRuns.filter((run) => run.status === "running" || run.status === "queued");
-          const selection = selectedKey !== "main" ? visibleRuns.find((run) => run.runId === selectedKey) : undefined;
-          const left = `${running.length} active · ${running.slice(0, 2).map((run) => `${run.agent} ${formatElapsed(run)}`).join(" · ")}`;
-          const right = selection
-            ? `selected ${selection.agent} ${selection.status}`
-            : selectorActive
-              ? "enter inspect"
-              : "↓ open roster";
-          return [truncateLine(` ${left} · ${right} `, width)];
-        },
-        invalidate() {},
-        dispose() {},
-      }));
-      footerRegistered = true;
-    }
+    if (!USE_LEGACY_FOOTER) return;
   }
 
   function refreshUi(ctx?: any) {
+    pruneFleetEntries();
     updateStatus(ctx);
     updateUiWidget(ctx);
     setFooter(ctx);
@@ -277,8 +301,11 @@ export default function (pi: ExtensionAPI) {
     if (uiInputUnsubscribe) uiInputUnsubscribe();
     uiInputUnsubscribe = undefined;
     if (uiCtx) {
-      try { uiCtx.ui.setWidget("pi-subagent-runs", undefined); } catch {}
+      try { uiCtx.ui.setWidget(FLEET_WIDGET_KEY, undefined); } catch {}
+      try { uiCtx.ui.setWidget(LEGACY_WIDGET_KEY, undefined); } catch {}
+      try { uiCtx.ui.setFooter(undefined); } catch {}
     }
+    fleetEntries.clear();
     widgetRegistered = false;
     widgetTui = undefined;
     footerRegistered = false;
@@ -290,8 +317,8 @@ export default function (pi: ExtensionAPI) {
 
   function handleTerminalKey(data: string) {
     const target = uiCtx;
-    const records = visibleUiRuns();
-    if (!target || isKeyRelease(data) || records.length === 0) return undefined;
+    const entries = visibleFleetEntries();
+    if (!target || isKeyRelease(data) || entries.length === 0) return undefined;
     if (!editorHasFocus(widgetTui)) {
       if (selectorActive || inspectorOpen) {
         selectorActive = false;
@@ -342,12 +369,12 @@ export default function (pi: ExtensionAPI) {
       const activates = matchesKey(data, "down") || matchesKey(data, "left");
       if (!activates || target.ui.getEditorText() !== "") return undefined;
       selectorActive = true;
-      selectedKey = records[0]?.runId || "main";
+      selectedKey = entries[0]?.key || "main";
       refreshUi();
       return { consume: true };
     }
 
-    const roster = ["main", ...records.map((record) => record.runId)];
+    const roster = ["main", ...entries.map((entry) => entry.key)];
     const selectedIndex = Math.max(0, roster.indexOf(selectedKey));
     if (matchesKey(data, "down") || matchesKey(data, "j")) {
       selectedKey = roster[Math.min(roster.length - 1, selectedIndex + 1)] || "main";
@@ -398,7 +425,7 @@ export default function (pi: ExtensionAPI) {
     uiRefreshTimer = setInterval(() => {
       reconcileStoredRuns();
       refreshUi();
-    }, 1000);
+    }, FLEET_REFRESH_MS);
     uiRefreshTimer.unref?.();
     refresh(ctx.cwd);
     deliverPendingNotifications(pi, currentSessionId);
@@ -921,6 +948,7 @@ function launchAsyncRun(
     stepLabel: options.stepLabel,
   };
   persistRunRecord(record);
+  upsertFleetEntry(fleetEntryFromRecord(record, "async"));
   appendRunEntry(pi, record, "started");
 
   const proc = spawn("pi", plan.args, {
@@ -949,6 +977,7 @@ function launchAsyncRun(
     active.timer = setTimeout(() => {
       active.record.timedOut = true;
       active.record.status = "timed_out";
+      updateFleetStatus(runId, "timed_out");
       persistRunRecord(active.record);
       proc.kill("SIGTERM");
     }, plan.timeoutMs);
@@ -960,19 +989,20 @@ function launchAsyncRun(
     active.stdoutBuffer += chunk;
     const lines = active.stdoutBuffer.split("\n");
     active.stdoutBuffer = lines.pop() || "";
-    for (const line of lines) consumeJsonLine(line, active.outputChunks);
+    for (const line of lines) consumeJsonLine(line, active.outputChunks, (activity) => updateFleetActivity(runId, activity));
     persistRunBuffers(active);
   });
 
   proc.stderr.setEncoding("utf8");
   proc.stderr.on("data", (chunk: string) => {
     active.stderrChunks.push(chunk);
+    updateFleetPreview(runId, chunk);
     persistRunBuffers(active);
   });
 
   proc.on("close", (code) => {
     if (active.timer) clearTimeout(active.timer);
-    if (active.stdoutBuffer.trim()) consumeJsonLine(active.stdoutBuffer, active.outputChunks);
+    if (active.stdoutBuffer.trim()) consumeJsonLine(active.stdoutBuffer, active.outputChunks, (activity) => updateFleetActivity(runId, activity));
     if (active.record.status === "running") active.record.status = code === 0 ? "completed" : "failed";
     if (active.record.stopped) active.record.status = "stopped";
     if (active.record.timedOut) active.record.status = "timed_out";
@@ -982,6 +1012,7 @@ function launchAsyncRun(
     finalizeRunArtifacts(active.record, active.outputChunks.join(""), active.stderrChunks.join(""));
     persistRunBuffers(active);
     persistRunRecord(active.record);
+    finishFleetEntry(runId, active.record.status);
     appendRunEntry(pi, active.record, "completed");
     deliverRunNotification(pi, active.record);
     activeRuns.delete(runId);
@@ -990,6 +1021,7 @@ function launchAsyncRun(
   proc.on("error", (error) => {
     if (active.timer) clearTimeout(active.timer);
     active.stderrChunks.push(error.message);
+    updateFleetPreview(runId, error.message);
     active.record.status = "spawn_error";
     active.record.exitCode = 1;
     active.record.finishedAt = new Date().toISOString();
@@ -997,6 +1029,7 @@ function launchAsyncRun(
     finalizeRunArtifacts(active.record, active.outputChunks.join(""), active.stderrChunks.join(""));
     persistRunBuffers(active);
     persistRunRecord(active.record);
+    finishFleetEntry(runId, active.record.status);
     appendRunEntry(pi, active.record, "completed");
     deliverRunNotification(pi, active.record);
     activeRuns.delete(runId);
@@ -1010,7 +1043,8 @@ async function runChildAgentForeground(
   options: RunRequest,
   ctx: any,
 ): Promise<{ output: string; exitCode: number; elapsedMs: number; timedOut: boolean; model?: string; attemptedModels: string[]; timeoutMs?: number; command: string[]; contextMode: ContextMode; childSessionFile?: string }> {
-  const runDir = join(RUNS_DIR, `${createRunId(`${agent.runtimeName}-fg`)}`);
+  const runId = createRunId(`${agent.runtimeName}-fg`);
+  const runDir = join(RUNS_DIR, runId);
   mkdirSync(runDir, { recursive: true });
   const candidates = uniqueStrings([options.model, agent.override.model, ...(agent.override.fallbackModels || [])]);
   let lastResult: { output: string; exitCode: number; elapsedMs: number; timedOut: boolean; model?: string; timeoutMs?: number; command: string[]; contextMode: ContextMode; childSessionFile?: string } | undefined;
@@ -1018,6 +1052,22 @@ async function runChildAgentForeground(
 
   for (const candidate of candidates.length > 0 ? candidates : [undefined]) {
     const plan = buildChildPlan(agent, { ...options, model: candidate }, ctx, runDir);
+    upsertFleetEntry({
+      key: runId,
+      runId,
+      kind: "foreground",
+      agent: agent.runtimeName,
+      task: options.task,
+      status: "running",
+      cwd: options.cwd,
+      contextMode: plan.contextMode,
+      startedAtMs: fleetEntries.get(runId)?.startedAtMs || Date.now(),
+      updatedAtMs: Date.now(),
+      model: plan.model,
+      stepLabel: options.stepLabel,
+      groupId: options.groupId,
+      childSessionFile: plan.childSessionFile,
+    });
     const env = { ...process.env, [DEPTH_ENV]: String(options.depth) };
     const result = await new Promise<{ output: string; exitCode: number; elapsedMs: number; timedOut: boolean; model?: string; timeoutMs?: number; command: string[]; contextMode: ContextMode; childSessionFile?: string }>((resolveRun) => {
       const startedAt = Date.now();
@@ -1028,6 +1078,7 @@ async function runChildAgentForeground(
       const stderrChunks: string[] = [];
       const timer = plan.timeoutMs ? setTimeout(() => {
         timedOut = true;
+        updateFleetStatus(runId, "timed_out");
         proc.kill("SIGTERM");
       }, plan.timeoutMs) : null;
       timer?.unref?.();
@@ -1037,15 +1088,18 @@ async function runChildAgentForeground(
         buffer += chunk;
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
-        for (const line of lines) consumeJsonLine(line, textChunks);
+        for (const line of lines) consumeJsonLine(line, textChunks, (activity) => updateFleetActivity(runId, activity));
       });
 
       proc.stderr.setEncoding("utf8");
-      proc.stderr.on("data", (chunk: string) => stderrChunks.push(chunk));
+      proc.stderr.on("data", (chunk: string) => {
+        stderrChunks.push(chunk);
+        updateFleetPreview(runId, chunk);
+      });
 
       proc.on("close", (code) => {
         if (timer) clearTimeout(timer);
-        if (buffer.trim()) consumeJsonLine(buffer, textChunks);
+        if (buffer.trim()) consumeJsonLine(buffer, textChunks, (activity) => updateFleetActivity(runId, activity));
         const output = textChunks.join("").trim() || stderrChunks.join("").trim();
         resolveRun({
           output,
@@ -1062,6 +1116,7 @@ async function runChildAgentForeground(
 
       proc.on("error", (error) => {
         if (timer) clearTimeout(timer);
+        updateFleetPreview(runId, error.message);
         resolveRun({
           output: error.message,
           exitCode: 1,
@@ -1079,7 +1134,11 @@ async function runChildAgentForeground(
     if (result.model) attempted.push(result.model);
     lastResult = result;
     if (result.exitCode === 0 || candidate === candidates[candidates.length - 1]) break;
+    updateFleetPreview(runId, `\nRetrying ${agent.runtimeName} with next model...\n`);
   }
+
+  const finalStatus: FleetEntryStatus = lastResult?.timedOut ? "timed_out" : lastResult?.exitCode === 0 ? "completed" : "failed";
+  finishFleetEntry(runId, finalStatus);
 
   const fallback = lastResult || {
     output: "Failed before launch.",
@@ -1218,10 +1277,11 @@ function extractEntryText(entry: any): string {
     .join("\n");
 }
 
-function consumeJsonLine(line: string, textChunks: string[]) {
+function consumeJsonLine(line: string, textChunks: string[], onActivity?: (activity: ChildActivity) => void) {
   if (!line.trim()) return;
   try {
     const event = JSON.parse(line) as any;
+    const activity = extractChildActivity(event);
     if (event.type === "message_update") {
       const delta = event.assistantMessageEvent;
       if (delta?.type === "text_delta" && typeof delta.delta === "string") textChunks.push(delta.delta);
@@ -1236,9 +1296,82 @@ function consumeJsonLine(line: string, textChunks: string[]) {
         if (text) textChunks.push(text);
       }
     }
+    if (onActivity && Object.keys(activity).length > 0) onActivity(activity);
   } catch {
     // ignore non-json noise
   }
+}
+
+function extractChildActivity(event: any): ChildActivity {
+  const activity: ChildActivity = {};
+  const delta = event?.assistantMessageEvent;
+  if (delta?.type === "text_delta" && typeof delta.delta === "string") activity.textDelta = delta.delta;
+  if (event?.type === "message_end" && event?.message?.role === "assistant") activity.turnEnded = true;
+
+  const tool = findToolHint(event);
+  if (tool.name) {
+    activity.toolName = tool.name;
+    activity.toolArgs = tool.args;
+  }
+  const path = findPathHint(event);
+  if (path) activity.path = path;
+  const tokens = findTokenHint(event);
+  if (tokens !== undefined) activity.tokens = tokens;
+  return activity;
+}
+
+function findToolHint(value: unknown, depth = 0): { name?: string; args?: string } {
+  if (!value || typeof value !== "object" || depth > 5) return {};
+  const record = value as Record<string, unknown>;
+  const type = typeof record.type === "string" ? record.type.toLowerCase() : "";
+  const name = typeof record.name === "string" ? record.name : typeof record.toolName === "string" ? record.toolName : undefined;
+  if (name && (type.includes("tool") || "toolName" in record || "input" in record || "arguments" in record)) {
+    const args = summarizeToolArgs(record.input ?? record.arguments ?? record.args);
+    return { name, args };
+  }
+  for (const child of Object.values(record)) {
+    const found = findToolHint(child, depth + 1);
+    if (found.name) return found;
+  }
+  return {};
+}
+
+function summarizeToolArgs(value: unknown): string | undefined {
+  if (typeof value === "string") return truncateLine(value.replace(/\s+/g, " "), 80);
+  if (!value || typeof value !== "object") return undefined;
+  try {
+    return truncateLine(JSON.stringify(value), 80);
+  } catch {
+    return undefined;
+  }
+}
+
+function findPathHint(value: unknown, depth = 0): string | undefined {
+  if (!value || typeof value !== "object" || depth > 5) return undefined;
+  const record = value as Record<string, unknown>;
+  for (const key of ["path", "file", "filePath", "cwd"] as const) {
+    if (typeof record[key] === "string") return truncateLine(record[key], 120);
+  }
+  for (const child of Object.values(record)) {
+    const found = findPathHint(child, depth + 1);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function findTokenHint(value: unknown, depth = 0): number | undefined {
+  if (!value || typeof value !== "object" || depth > 5) return undefined;
+  const record = value as Record<string, unknown>;
+  const direct = record.tokens ?? record.totalTokens ?? record.total_tokens;
+  if (typeof direct === "number" && Number.isFinite(direct)) return direct;
+  const input = record.inputTokens ?? record.input_tokens ?? record.prompt_tokens;
+  const output = record.outputTokens ?? record.output_tokens ?? record.completion_tokens;
+  if (typeof input === "number" && typeof output === "number") return input + output;
+  for (const child of Object.values(record)) {
+    const found = findTokenHint(child, depth + 1);
+    if (found !== undefined) return found;
+  }
+  return undefined;
 }
 
 function getRunStatus(runId: string | undefined): { isError?: boolean; runId?: string; run?: RunRecord; runs?: RunRecord[]; outputPreview?: string; stderrPreview?: string } {
@@ -1396,6 +1529,111 @@ function getVisibleUiRecords(records: RunRecord[], now = Date.now()): RunRecord[
   return records.filter((record) => shouldShowInUi(record, records, now));
 }
 
+function getVisibleFleetEntries(records: RunRecord[], now = Date.now()): FleetEntry[] {
+  const entries = new Map<string, FleetEntry>();
+  for (const record of getVisibleUiRecords(records, now)) {
+    entries.set(record.runId, fleetEntryFromRecord(record, "async"));
+  }
+  for (const entry of fleetEntries.values()) {
+    if (shouldShowFleetEntry(entry, now)) entries.set(entry.key, entry);
+  }
+  return Array.from(entries.values()).sort((a, b) => {
+    const activeA = a.status === "running" || a.status === "queued" ? 1 : 0;
+    const activeB = b.status === "running" || b.status === "queued" ? 1 : 0;
+    if (activeA !== activeB) return activeB - activeA;
+    return b.startedAtMs - a.startedAtMs;
+  });
+}
+
+function shouldShowFleetEntry(entry: FleetEntry, now = Date.now()): boolean {
+  if (entry.status === "running" || entry.status === "queued") return true;
+  if (!entry.finishedAtMs) return false;
+  return now - entry.finishedAtMs <= COMPLETED_UI_GRACE_MS;
+}
+
+function pruneFleetEntries(now = Date.now()) {
+  for (const [key, entry] of fleetEntries) {
+    if (!shouldShowFleetEntry(entry, now)) fleetEntries.delete(key);
+  }
+}
+
+function fleetEntryFromRecord(record: RunRecord, kind: FleetEntryKind): FleetEntry {
+  const existing = fleetEntries.get(record.runId);
+  const startedAtMs = Date.parse(record.startedAt);
+  const finishedAtMs = record.finishedAt ? Date.parse(record.finishedAt) : undefined;
+  return {
+    key: record.runId,
+    runId: record.runId,
+    kind,
+    agent: record.agent,
+    task: record.task,
+    status: record.status,
+    cwd: record.cwd,
+    contextMode: record.contextMode,
+    startedAtMs: Number.isFinite(startedAtMs) ? startedAtMs : existing?.startedAtMs || Date.now(),
+    updatedAtMs: existing?.updatedAtMs || Date.now(),
+    finishedAtMs: typeof finishedAtMs === "number" && Number.isFinite(finishedAtMs) ? finishedAtMs : existing?.finishedAtMs,
+    model: record.model,
+    stepLabel: record.stepLabel,
+    groupId: record.groupId,
+    outputPreview: existing?.outputPreview,
+    currentTool: existing?.currentTool,
+    currentToolArgs: existing?.currentToolArgs,
+    currentPath: existing?.currentPath,
+    turnCount: existing?.turnCount,
+    toolCount: existing?.toolCount,
+    tokens: existing?.tokens,
+    outputPath: record.outputPath,
+    stderrPath: record.stderrPath,
+    artifactPath: record.resultFullPath,
+    childSessionFile: record.childSessionFile,
+  };
+}
+
+function upsertFleetEntry(entry: FleetEntry) {
+  const previous = fleetEntries.get(entry.key);
+  fleetEntries.set(entry.key, { ...previous, ...entry, updatedAtMs: Date.now() });
+  refreshExternalUi();
+}
+
+function updateFleetStatus(key: string, status: FleetEntryStatus) {
+  const entry = fleetEntries.get(key);
+  if (!entry) return;
+  entry.status = status;
+  entry.updatedAtMs = Date.now();
+  if (status !== "running" && status !== "queued") entry.finishedAtMs = Date.now();
+  refreshExternalUi();
+}
+
+function finishFleetEntry(key: string, status: FleetEntryStatus) {
+  updateFleetStatus(key, status);
+}
+
+function updateFleetPreview(key: string, chunk: string) {
+  const entry = fleetEntries.get(key);
+  if (!entry || !chunk) return;
+  const cleaned = chunk.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+  entry.outputPreview = truncateFromEnd(`${entry.outputPreview || ""}${cleaned}`, MAX_OUTPUT_PREVIEW_CHARS);
+  entry.updatedAtMs = Date.now();
+  refreshExternalUi();
+}
+
+function updateFleetActivity(key: string, activity: ChildActivity) {
+  const entry = fleetEntries.get(key);
+  if (!entry) return;
+  entry.updatedAtMs = Date.now();
+  if (activity.textDelta) entry.outputPreview = truncateFromEnd(`${entry.outputPreview || ""}${activity.textDelta}`, MAX_OUTPUT_PREVIEW_CHARS);
+  if (activity.toolName) {
+    entry.currentTool = activity.toolName;
+    entry.currentToolArgs = activity.toolArgs;
+    entry.toolCount = (entry.toolCount || 0) + 1;
+  }
+  if (activity.path) entry.currentPath = activity.path;
+  if (activity.turnEnded) entry.turnCount = (entry.turnCount || 0) + 1;
+  if (activity.tokens !== undefined) entry.tokens = activity.tokens;
+  refreshExternalUi();
+}
+
 function shouldShowInUi(record: RunRecord, records: RunRecord[], now = Date.now()): boolean {
   if (record.status === "running" || record.status === "queued") return true;
   const activeSiblingExists = Boolean(record.groupId)
@@ -1496,6 +1734,77 @@ function readPreview(path: string): string {
   return raw.length > 2000 ? `${raw.slice(0, 2000)}\n…` : raw;
 }
 
+function formatFleetHeadline(entry: FleetEntry, theme: any): string {
+  const parts = [entry.agent, colorStatus(theme, entry.status), formatFleetElapsed(entry)];
+  if (entry.kind === "foreground") parts.splice(1, 0, theme.fg("muted", "fg"));
+  if (entry.stepLabel) parts.push(theme.fg("dim", entry.stepLabel));
+  return parts.join(" · ");
+}
+
+function formatFleetActivity(entry: FleetEntry, maxWidth: number): string {
+  const parts: string[] = [];
+  if (entry.currentTool) {
+    parts.push(entry.currentToolArgs ? `${entry.currentTool} ${entry.currentToolArgs}` : entry.currentTool);
+  } else if (entry.status === "queued") {
+    parts.push("queued…");
+  } else if (entry.status === "running") {
+    const idleSeconds = Math.max(0, Math.round((Date.now() - entry.updatedAtMs) / 1000));
+    parts.push(entry.outputPreview ? `active · output ${idleSeconds}s ago` : "thinking…");
+  } else {
+    parts.push(entry.status);
+  }
+  if (entry.turnCount) parts.push(`${entry.turnCount} turns`);
+  if (entry.toolCount) parts.push(`${entry.toolCount} tools`);
+  if (entry.tokens) parts.push(`${formatCompactNumber(entry.tokens)} tokens`);
+  if (entry.currentPath) parts.push(entry.currentPath);
+  const preview = (entry.outputPreview || entry.task).split("\n").map((line) => line.trim()).filter(Boolean).slice(-1)[0];
+  if (preview) parts.push(truncateLine(preview.replace(/\s+/g, " "), Math.max(12, maxWidth - parts.join(" · ").length - 3)));
+  return truncateLine(parts.join(" · "), Math.max(12, maxWidth));
+}
+
+function renderFleetInspector(entry: FleetEntry, width: number, theme: any, scroll: number): string[] {
+  const diskOutput = entry.outputPath ? readPreview(entry.outputPath) : "";
+  const diskStderr = entry.stderrPath ? readPreview(entry.stderrPath) : "";
+  const transcript = (entry.outputPreview || diskOutput || diskStderr || entry.task)
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const lines = [
+    truncateToWidth(`  ${theme.fg("dim", "esc/← back · ↑↓ scroll · pgup/pgdn page")}`, width),
+    "",
+    truncateToWidth(`  ${theme.fg("accent", entry.agent)} · ${entry.kind} · ${colorStatus(theme, entry.status)} · ${formatFleetElapsed(entry)}`, width),
+    truncateToWidth(`  runId: ${entry.runId}`, width),
+    entry.contextMode ? truncateToWidth(`  context: ${entry.contextMode}`, width) : "",
+    truncateToWidth(`  model: ${entry.model || "default"}`, width),
+    truncateToWidth(`  cwd: ${entry.cwd}`, width),
+    entry.childSessionFile ? truncateToWidth(`  childSession: ${entry.childSessionFile}`, width) : "",
+    entry.groupId ? truncateToWidth(`  group: ${entry.groupId}`, width) : "",
+    entry.currentTool ? truncateToWidth(`  currentTool: ${entry.currentTool}${entry.currentToolArgs ? ` ${entry.currentToolArgs}` : ""}`, width) : "",
+    entry.turnCount ? truncateToWidth(`  turns: ${entry.turnCount}`, width) : "",
+    entry.toolCount ? truncateToWidth(`  tools: ${entry.toolCount}`, width) : "",
+    entry.tokens ? truncateToWidth(`  tokens: ${entry.tokens}`, width) : "",
+    entry.artifactPath ? truncateToWidth(`  artifact: ${entry.artifactPath}`, width) : "",
+    "",
+    truncateToWidth(`  task: ${truncateLine(entry.task.replace(/\s+/g, " "), Math.max(10, width - 8))}`, width),
+    "",
+    truncateToWidth("  latest activity", width),
+    ...transcript.map((line) => truncateToWidth(`    ${line}`, width)),
+  ].filter(Boolean);
+  const maxVisible = 22;
+  const clampedScroll = Math.max(0, Math.min(scroll, Math.max(0, lines.length - maxVisible)));
+  return lines.slice(clampedScroll, clampedScroll + maxVisible);
+}
+
+function formatFleetElapsed(entry: FleetEntry): string {
+  const end = entry.finishedAtMs || Date.now();
+  return `${Math.max(0, Math.round((end - entry.startedAtMs) / 1000))}s`;
+}
+
+function formatCompactNumber(value: number): string {
+  if (value >= 1000) return `${(value / 1000).toFixed(value >= 10_000 ? 0 : 1)}k`;
+  return String(value);
+}
+
 function renderRosterLine(width: number, theme: any, rosterIndex: number, selectedIndex: number, _key: string, label: string): string {
   const bullet = rosterIndex === selectedIndex ? theme.fg("accent", "⏺") : theme.fg("dim", "◯");
   return truncateToWidth(`  ${bullet} ${label}`, width);
@@ -1563,6 +1872,11 @@ function latestRecordLine(record: RunRecord): string {
 function truncateLine(value: string, max: number): string {
   if (max <= 1) return value.slice(0, Math.max(0, max));
   return value.length > max ? `${value.slice(0, Math.max(0, max - 1))}…` : value;
+}
+
+function truncateFromEnd(value: string, max: number): string {
+  if (value.length <= max) return value;
+  return `…${value.slice(Math.max(0, value.length - max + 1))}`;
 }
 
 function parseMarkdownAgent(raw: string): { frontmatter: JsonObject; body: string } | null {
