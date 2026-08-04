@@ -50,6 +50,8 @@ type ChildActivity = {
   textDelta?: string;
   toolName?: string;
   toolArgs?: string;
+  toolStarted?: boolean;
+  toolEnded?: boolean;
   path?: string;
   turnEnded?: boolean;
   tokens?: number;
@@ -157,6 +159,7 @@ type RunRequest = {
   stepIndex?: number;
   totalSteps?: number;
   stepLabel?: string;
+  onUpdate?: (result: any) => void;
 };
 
 type ChildPlan = {
@@ -647,6 +650,7 @@ export default function (pi: ExtensionAPI) {
         context: input.context || agent.override.defaultContext || "fresh",
         parentSessionId,
         parentSessionFile,
+        onUpdate: _onUpdate,
       };
 
       if (input.async ?? agent.override.async) {
@@ -1108,6 +1112,8 @@ async function runChildAgentForeground(
       groupId: options.groupId,
       childSessionFile: plan.childSessionFile,
     });
+    let emitForegroundUpdate = makeForegroundUpdateEmitter(options.onUpdate, runId);
+    emitForegroundUpdate();
     const env = { ...process.env, [DEPTH_ENV]: String(options.depth) };
     const result = await new Promise<{ output: string; exitCode: number; elapsedMs: number; timedOut: boolean; model?: string; thinking?: string; timeoutMs?: number; command: string[]; contextMode: ContextMode; childSessionFile?: string }>((resolveRun) => {
       const startedAt = Date.now();
@@ -1128,18 +1134,25 @@ async function runChildAgentForeground(
         buffer += chunk;
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
-        for (const line of lines) consumeJsonLine(line, textChunks, (activity) => updateFleetActivity(runId, activity));
+        for (const line of lines) consumeJsonLine(line, textChunks, (activity) => {
+          updateFleetActivity(runId, activity);
+          emitForegroundUpdate();
+        });
       });
 
       proc.stderr.setEncoding("utf8");
       proc.stderr.on("data", (chunk: string) => {
         stderrChunks.push(chunk);
         updateFleetPreview(runId, chunk);
+        emitForegroundUpdate();
       });
 
       proc.on("close", (code) => {
         if (timer) clearTimeout(timer);
-        if (buffer.trim()) consumeJsonLine(buffer, textChunks, (activity) => updateFleetActivity(runId, activity));
+        if (buffer.trim()) consumeJsonLine(buffer, textChunks, (activity) => {
+          updateFleetActivity(runId, activity);
+          emitForegroundUpdate(true);
+        });
         const output = textChunks.join("").trim() || stderrChunks.join("").trim();
         resolveRun({
           output,
@@ -1158,6 +1171,7 @@ async function runChildAgentForeground(
       proc.on("error", (error) => {
         if (timer) clearTimeout(timer);
         updateFleetPreview(runId, error.message);
+        emitForegroundUpdate(true);
         resolveRun({
           output: error.message,
           exitCode: 1,
@@ -1177,10 +1191,12 @@ async function runChildAgentForeground(
     lastResult = result;
     if (result.exitCode === 0 || candidate === candidates[candidates.length - 1]) break;
     updateFleetPreview(runId, `\nRetrying ${agent.runtimeName} with next model...\n`);
+    emitForegroundUpdate(true);
   }
 
   const finalStatus: FleetEntryStatus = lastResult?.timedOut ? "timed_out" : lastResult?.exitCode === 0 ? "completed" : "failed";
   finishFleetEntry(runId, finalStatus);
+  makeForegroundUpdateEmitter(options.onUpdate, runId)(true);
 
   const fallback = lastResult || {
     output: "Failed before launch.",
@@ -1372,11 +1388,22 @@ function extractChildActivity(event: any): ChildActivity {
   if (delta?.type === "text_delta" && typeof delta.delta === "string") activity.textDelta = delta.delta;
   if (event?.type === "message_end" && event?.message?.role === "assistant") activity.turnEnded = true;
 
-  const tool = findToolHint(event);
-  if (tool.name) {
-    activity.toolName = tool.name;
-    activity.toolArgs = tool.args;
+  if (event?.type === "tool_execution_start") {
+    activity.toolStarted = true;
+    activity.toolName = asNonEmptyString(event.toolName);
+    activity.toolArgs = summarizeToolArgs(event.args);
+    const directPath = findPathHint(event.args);
+    if (directPath) activity.path = directPath;
+  } else if (event?.type === "tool_execution_end" || event?.type === "tool_result_end") {
+    activity.toolEnded = true;
+  } else {
+    const tool = findToolHint(event);
+    if (tool.name) {
+      activity.toolName = tool.name;
+      activity.toolArgs = tool.args;
+    }
   }
+
   const path = findPathHint(event);
   if (path) activity.path = path;
   const tokens = findTokenHint(event);
@@ -1693,12 +1720,63 @@ function updateFleetActivity(key: string, activity: ChildActivity) {
   if (activity.toolName) {
     entry.currentTool = activity.toolName;
     entry.currentToolArgs = activity.toolArgs;
-    entry.toolCount = (entry.toolCount || 0) + 1;
+    if (activity.toolStarted) entry.toolCount = (entry.toolCount || 0) + 1;
   }
   if (activity.path) entry.currentPath = activity.path;
+  if (activity.toolEnded) {
+    entry.currentTool = undefined;
+    entry.currentToolArgs = undefined;
+    entry.currentPath = undefined;
+  }
   if (activity.turnEnded) entry.turnCount = (entry.turnCount || 0) + 1;
   if (activity.tokens !== undefined) entry.tokens = activity.tokens;
   refreshExternalUi();
+}
+
+function makeForegroundUpdateEmitter(onUpdate: ((result: any) => void) | undefined, key: string) {
+  let lastEmit = 0;
+  return (force = false) => {
+    if (!onUpdate) return;
+    const now = Date.now();
+    if (!force && now - lastEmit < 300) return;
+    lastEmit = now;
+    const entry = fleetEntries.get(key);
+    if (!entry) return;
+    const text = renderForegroundProgressText(entry);
+    try {
+      onUpdate({
+        content: [{ type: "text", text }],
+        details: {
+          action: "run",
+          mode: "foreground",
+          progress: [{
+            runId: entry.runId,
+            agent: entry.agent,
+            status: entry.status,
+            currentTool: entry.currentTool,
+            currentToolArgs: entry.currentToolArgs,
+            currentPath: entry.currentPath,
+            turnCount: entry.turnCount,
+            toolCount: entry.toolCount,
+            tokens: entry.tokens,
+            outputPreview: entry.outputPreview,
+          }],
+        },
+      });
+    } catch {
+      // Live tool updates are best-effort; the final tool result still returns normally.
+    }
+  };
+}
+
+function renderForegroundProgressText(entry: FleetEntry): string {
+  const lines = [
+    `Subagent ${entry.agent} ${entry.status} (${formatFleetElapsed(entry)}).`,
+    `Activity: ${formatFleetActivity(entry, 120)}`,
+  ];
+  if (entry.currentTool) lines.push(`Current tool: ${entry.currentTool}${entry.currentToolArgs ? ` ${entry.currentToolArgs}` : ""}`);
+  if (entry.currentPath) lines.push(`Path: ${entry.currentPath}`);
+  return lines.join("\n");
 }
 
 function shouldShowInUi(record: RunRecord, records: RunRecord[], now = Date.now()): boolean {
