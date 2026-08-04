@@ -103,6 +103,7 @@ type RunRecord = {
   cwd: string;
   contextMode: ContextMode;
   model?: string;
+  thinking?: string;
   modelCandidates?: string[];
   timeoutMs?: number;
   command: string[];
@@ -145,6 +146,7 @@ type ActiveRun = {
 type RunRequest = {
   task: string;
   model?: string;
+  thinking?: string;
   cwd: string;
   timeoutMs?: number;
   depth: number;
@@ -160,6 +162,7 @@ type RunRequest = {
 type ChildPlan = {
   args: string[];
   model?: string;
+  thinking?: string;
   modelCandidates: string[];
   timeoutMs?: number;
   contextMode: ContextMode;
@@ -482,6 +485,7 @@ export default function (pi: ExtensionAPI) {
         agent: Type.String(),
         task: Type.String(),
         model: Type.Optional(Type.String()),
+        thinking: Type.Optional(Type.String()),
         cwd: Type.Optional(Type.String()),
         timeoutMs: Type.Optional(Type.Integer({ minimum: 1 })),
       })) ),
@@ -489,10 +493,12 @@ export default function (pi: ExtensionAPI) {
         agent: Type.String(),
         task: Type.String(),
         model: Type.Optional(Type.String()),
+        thinking: Type.Optional(Type.String()),
         cwd: Type.Optional(Type.String()),
         timeoutMs: Type.Optional(Type.Integer({ minimum: 1 })),
       })) ),
       model: Type.Optional(Type.String({ description: "Optional one-off model override" })),
+      thinking: Type.Optional(Type.String({ description: "Optional one-off thinking override" })),
       cwd: Type.Optional(Type.String({ description: "Working directory for the child run" })),
       context: Type.Optional(Type.Union([Type.Literal("fresh"), Type.Literal("fork")], { description: "fresh starts isolated; fork copies the current session into a child session file." })),
       timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Optional child timeout override in ms" })),
@@ -504,9 +510,10 @@ export default function (pi: ExtensionAPI) {
         action?: "list" | "reload" | "status" | "stop";
         agent?: string;
         task?: string;
-        tasks?: Array<{ agent: string; task: string; model?: string; cwd?: string; timeoutMs?: number }>;
-        chain?: Array<{ agent: string; task: string; model?: string; cwd?: string; timeoutMs?: number }>;
+        tasks?: Array<{ agent: string; task: string; model?: string; thinking?: string; cwd?: string; timeoutMs?: number }>;
+        chain?: Array<{ agent: string; task: string; model?: string; thinking?: string; cwd?: string; timeoutMs?: number }>;
         model?: string;
+        thinking?: string;
         cwd?: string;
         context?: ContextMode;
         timeoutMs?: number;
@@ -586,6 +593,7 @@ export default function (pi: ExtensionAPI) {
           const launched = steps.value.map((step, index) => launchAsyncRun(pi, step.agent, {
             task: step.task,
             model: step.model,
+            thinking: step.thinking,
             cwd: step.cwd || input.cwd || ctx.cwd,
             timeoutMs: step.timeoutMs || input.timeoutMs,
             depth: currentDepth + 1,
@@ -632,6 +640,7 @@ export default function (pi: ExtensionAPI) {
       const request: RunRequest = {
         task: input.task,
         model: input.model,
+        thinking: input.thinking,
         cwd: input.cwd || ctx.cwd,
         timeoutMs: input.timeoutMs,
         depth: currentDepth + 1,
@@ -658,6 +667,7 @@ export default function (pi: ExtensionAPI) {
           mode: "foreground",
           agent: agent.runtimeName,
           model: runResult.model,
+          thinking: runResult.thinking,
           attemptedModels: runResult.attemptedModels,
           command: runResult.command,
           timeoutMs: runResult.timeoutMs,
@@ -685,10 +695,10 @@ function toolError(text: string) {
 
 function resolveRequestedTasks(
   agents: AgentDef[],
-  tasks: Array<{ agent: string; task: string; model?: string; cwd?: string; timeoutMs?: number }>,
+  tasks: Array<{ agent: string; task: string; model?: string; thinking?: string; cwd?: string; timeoutMs?: number }>,
   currentDepth: number,
-): { value: Array<{ agent: AgentDef; task: string; model?: string; cwd?: string; timeoutMs?: number }>; error?: undefined } | { value?: undefined; error: string } {
-  const resolved: Array<{ agent: AgentDef; task: string; model?: string; cwd?: string; timeoutMs?: number }> = [];
+): { value: Array<{ agent: AgentDef; task: string; model?: string; thinking?: string; cwd?: string; timeoutMs?: number }>; error?: undefined } | { value?: undefined; error: string } {
+  const resolved: Array<{ agent: AgentDef; task: string; model?: string; thinking?: string; cwd?: string; timeoutMs?: number }> = [];
   for (const task of tasks) {
     const agent = resolveAgent(agents, task.agent);
     if (!agent) return { error: `Unknown agent '${task.agent}'.` };
@@ -696,19 +706,20 @@ function resolveRequestedTasks(
     if (typeof maxDepth === "number" && currentDepth >= maxDepth) {
       return { error: `Blocked: agent '${agent.runtimeName}' reached maxSubagentDepth ${maxDepth}.` };
     }
-    resolved.push({ agent, task: task.task, model: task.model, cwd: task.cwd, timeoutMs: task.timeoutMs });
+    resolved.push({ agent, task: task.task, model: task.model, thinking: task.thinking, cwd: task.cwd, timeoutMs: task.timeoutMs });
   }
   return { value: resolved };
 }
 
 async function runParallelForeground(
-  steps: Array<{ agent: AgentDef; task: string; model?: string; cwd?: string; timeoutMs?: number }>,
+  steps: Array<{ agent: AgentDef; task: string; model?: string; thinking?: string; cwd?: string; timeoutMs?: number }>,
   options: { cwd: string; depth: number; context: ContextMode; parentSessionId?: string; parentSessionFile?: string },
   ctx: any,
 ) {
   const results = await Promise.all(steps.map((step) => runChildAgentForeground(step.agent, {
     task: step.task,
     model: step.model,
+    thinking: step.thinking,
     cwd: step.cwd || options.cwd,
     timeoutMs: step.timeoutMs,
     depth: options.depth,
@@ -729,7 +740,7 @@ async function runParallelForeground(
 
 async function runChainForeground(
   pi: ExtensionAPI,
-  steps: Array<{ agent: AgentDef; task: string; model?: string; cwd?: string; timeoutMs?: number }>,
+  steps: Array<{ agent: AgentDef; task: string; model?: string; thinking?: string; cwd?: string; timeoutMs?: number }>,
   options: { cwd: string; depth: number; context: ContextMode; parentSessionId?: string; parentSessionFile?: string },
   ctx: any,
 ) {
@@ -743,6 +754,7 @@ async function runChainForeground(
     const result = await runChildAgentForeground(step.agent, {
       task,
       model: step.model,
+      thinking: step.thinking,
       cwd: step.cwd || options.cwd,
       timeoutMs: step.timeoutMs,
       depth: options.depth,
@@ -761,7 +773,7 @@ async function runChainForeground(
 }
 
 function loadAgents(projectCwd = process.cwd()): AgentDef[] {
-  const overrides = loadOverrides();
+  const { defaults, agentOverrides } = loadRuntimePolicy();
   const resolved = new Map<string, AgentDef>();
 
   for (const dir of getAgentSourceDirs(projectCwd)) {
@@ -775,7 +787,7 @@ function loadAgents(projectCwd = process.cwd()): AgentDef[] {
       if (!name) continue;
       const packageName = asNonEmptyString(parsed.frontmatter.package);
       const runtimeName = packageName ? `${packageName}.${name}` : name;
-      const override = normalizeOverride(overrides[runtimeName] ?? overrides[name] ?? {});
+      const override = mergeOverrides(defaults, normalizeOverride(agentOverrides[runtimeName] ?? agentOverrides[name] ?? {}));
       if (override.disabled === true) continue;
       resolved.set(runtimeName, {
         name,
@@ -792,12 +804,38 @@ function loadAgents(projectCwd = process.cwd()): AgentDef[] {
   return Array.from(resolved.values()).sort((a, b) => a.runtimeName.localeCompare(b.runtimeName));
 }
 
-function loadOverrides(): Record<string, JsonObject> {
-  if (!existsSync(CONFIG_PATH)) return {};
+function loadRuntimePolicy(): { defaults: OverrideConfig; agentOverrides: Record<string, JsonObject> } {
+  if (!existsSync(CONFIG_PATH)) return { defaults: {}, agentOverrides: {} };
   const parsed = parseJsonc(readFileSync(CONFIG_PATH, "utf8"));
-  const raw = parsed.agentOverrides;
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
-  return raw as Record<string, JsonObject>;
+  const rawDefaults = parsed.defaults;
+  const rawOverrides = parsed.agentOverrides;
+  return {
+    defaults: rawDefaults && typeof rawDefaults === "object" && !Array.isArray(rawDefaults) ? normalizeDefaultsPolicy(rawDefaults as JsonObject) : {},
+    agentOverrides: rawOverrides && typeof rawOverrides === "object" && !Array.isArray(rawOverrides) ? rawOverrides as Record<string, JsonObject> : {},
+  };
+}
+
+function normalizeDefaultsPolicy(input: JsonObject): OverrideConfig {
+  const defaults = normalizeOverride(input);
+  delete defaults.model;
+  delete defaults.fallbackModels;
+  delete defaults.thinking;
+  return defaults;
+}
+
+function mergeOverrides(defaults: OverrideConfig, override: OverrideConfig): OverrideConfig {
+  return {
+    ...defaults,
+    ...override,
+    fallbackModels: override.fallbackModels ?? defaults.fallbackModels,
+    tools: override.tools ?? defaults.tools,
+    turnBudget: override.turnBudget ?? defaults.turnBudget,
+    extensions: override.extensions ?? defaults.extensions,
+    subagentOnlyExtensions: override.subagentOnlyExtensions ?? defaults.subagentOnlyExtensions,
+    skills: override.skills ?? defaults.skills,
+    acceptance: override.acceptance ?? defaults.acceptance,
+    defaultReads: override.defaultReads ?? defaults.defaultReads,
+  };
 }
 
 function normalizeOverride(input: JsonObject): OverrideConfig {
@@ -805,7 +843,7 @@ function normalizeOverride(input: JsonObject): OverrideConfig {
     model: asNonEmptyString(input.model),
     fallbackModels: asStringArray(input.fallbackModels),
     thinking: asNonEmptyString(input.thinking),
-    tools: asStringArray(input.tools),
+    tools: normalizeToolList(asStringArray(input.tools)),
     defaultContext: input.defaultContext === "fresh" || input.defaultContext === "fork" ? input.defaultContext : undefined,
     timeoutMs: asPositiveInteger(input.timeoutMs),
     turnBudget: asTurnBudget(input.turnBudget),
@@ -892,6 +930,7 @@ function summarizeAgent(agent: AgentDef) {
     description: agent.description,
     sourcePath: agent.sourcePath,
     model: agent.override.model,
+    thinking: agent.override.thinking,
     fallbackModels: agent.override.fallbackModels,
     tools: agent.override.tools,
     extensions: agent.override.extensions,
@@ -927,6 +966,7 @@ function launchAsyncRun(
     cwd: options.cwd,
     contextMode: plan.contextMode,
     model: plan.model,
+    thinking: plan.thinking,
     modelCandidates: plan.modelCandidates,
     timeoutMs: plan.timeoutMs,
     command: plan.args,
@@ -1042,12 +1082,12 @@ async function runChildAgentForeground(
   agent: AgentDef,
   options: RunRequest,
   ctx: any,
-): Promise<{ output: string; exitCode: number; elapsedMs: number; timedOut: boolean; model?: string; attemptedModels: string[]; timeoutMs?: number; command: string[]; contextMode: ContextMode; childSessionFile?: string }> {
+): Promise<{ output: string; exitCode: number; elapsedMs: number; timedOut: boolean; model?: string; thinking?: string; attemptedModels: string[]; timeoutMs?: number; command: string[]; contextMode: ContextMode; childSessionFile?: string }> {
   const runId = createRunId(`${agent.runtimeName}-fg`);
   const runDir = join(RUNS_DIR, runId);
   mkdirSync(runDir, { recursive: true });
-  const candidates = uniqueStrings([options.model, agent.override.model, ...(agent.override.fallbackModels || [])]);
-  let lastResult: { output: string; exitCode: number; elapsedMs: number; timedOut: boolean; model?: string; timeoutMs?: number; command: string[]; contextMode: ContextMode; childSessionFile?: string } | undefined;
+  const candidates = getModelCandidates(agent, options, ctx);
+  let lastResult: { output: string; exitCode: number; elapsedMs: number; timedOut: boolean; model?: string; thinking?: string; timeoutMs?: number; command: string[]; contextMode: ContextMode; childSessionFile?: string } | undefined;
   const attempted: string[] = [];
 
   for (const candidate of candidates.length > 0 ? candidates : [undefined]) {
@@ -1069,7 +1109,7 @@ async function runChildAgentForeground(
       childSessionFile: plan.childSessionFile,
     });
     const env = { ...process.env, [DEPTH_ENV]: String(options.depth) };
-    const result = await new Promise<{ output: string; exitCode: number; elapsedMs: number; timedOut: boolean; model?: string; timeoutMs?: number; command: string[]; contextMode: ContextMode; childSessionFile?: string }>((resolveRun) => {
+    const result = await new Promise<{ output: string; exitCode: number; elapsedMs: number; timedOut: boolean; model?: string; thinking?: string; timeoutMs?: number; command: string[]; contextMode: ContextMode; childSessionFile?: string }>((resolveRun) => {
       const startedAt = Date.now();
       const proc = spawn("pi", plan.args, { cwd: options.cwd, env, stdio: ["ignore", "pipe", "pipe"] });
       let timedOut = false;
@@ -1107,6 +1147,7 @@ async function runChildAgentForeground(
           elapsedMs: Date.now() - startedAt,
           timedOut,
           model: plan.model,
+          thinking: plan.thinking,
           timeoutMs: plan.timeoutMs,
           command: plan.args,
           contextMode: plan.contextMode,
@@ -1123,6 +1164,7 @@ async function runChildAgentForeground(
           elapsedMs: Date.now() - startedAt,
           timedOut,
           model: plan.model,
+          thinking: plan.thinking,
           timeoutMs: plan.timeoutMs,
           command: plan.args,
           contextMode: plan.contextMode,
@@ -1146,6 +1188,7 @@ async function runChildAgentForeground(
     elapsedMs: 0,
     timedOut: false,
     model: candidates[0],
+    thinking: resolveThinking(agent, options, ctx),
     timeoutMs: options.timeoutMs || agent.override.timeoutMs,
     command: [],
     contextMode: options.context,
@@ -1154,10 +1197,30 @@ async function runChildAgentForeground(
   return { ...fallback, attemptedModels: attempted };
 }
 
+function getModelCandidates(agent: AgentDef, options: RunRequest, ctx: any): string[] {
+  const inheritedModel = currentParentModel(ctx);
+  return uniqueStrings([options.model, agent.override.model, ...(agent.override.fallbackModels || []), inheritedModel]);
+}
+
+function currentParentModel(ctx: any): string | undefined {
+  const model = ctx?.model;
+  if (!model) return undefined;
+  if (typeof model === "string") return model.trim() || undefined;
+  const provider = typeof model.provider === "string" ? model.provider : typeof model.provider?.id === "string" ? model.provider.id : undefined;
+  const id = typeof model.id === "string" ? model.id : typeof model.model === "string" ? model.model : undefined;
+  if (provider && id) return `${provider}/${id}`;
+  return id || undefined;
+}
+
+function resolveThinking(agent: AgentDef, options: RunRequest, ctx: any): string | undefined {
+  return options.thinking || agent.override.thinking || asNonEmptyString(ctx?.thinkingLevel) || asNonEmptyString(ctx?.thinking);
+}
+
 function buildChildPlan(agent: AgentDef, options: RunRequest, ctx: any, runDir: string): ChildPlan {
   const contextMode: ContextMode = options.context || agent.override.defaultContext || "fresh";
-  const modelCandidates = uniqueStrings([options.model, agent.override.model, ...(agent.override.fallbackModels || [])]);
+  const modelCandidates = getModelCandidates(agent, options, ctx);
   const model = modelCandidates[0];
+  const thinking = resolveThinking(agent, options, ctx);
   const timeoutMs = options.timeoutMs || agent.override.timeoutMs;
   const args = ["--mode", "json", "-p"];
 
@@ -1176,6 +1239,7 @@ function buildChildPlan(agent: AgentDef, options: RunRequest, ctx: any, runDir: 
   }
 
   if (model) args.push("--model", model);
+  if (thinking) args.push("--thinking", thinking);
   if (agent.override.tools) {
     args.push(agent.override.tools.length > 0 ? "--tools" : "--no-tools");
     if (agent.override.tools.length > 0) args.push(agent.override.tools.join(","));
@@ -1201,7 +1265,7 @@ function buildChildPlan(agent: AgentDef, options: RunRequest, ctx: any, runDir: 
   writeFileSync(taskPath, effectiveTask, "utf8");
   args.push(`@${taskPath}`);
 
-  return { args, model, modelCandidates, timeoutMs, contextMode, childSessionFile, effectiveTask };
+  return { args, model, thinking, modelCandidates, timeoutMs, contextMode, childSessionFile, effectiveTask };
 }
 
 function buildEffectiveSystemPrompt(agent: AgentDef, options: RunRequest, ctx: any): string {
@@ -1423,6 +1487,8 @@ function renderRunStatusText(result: { isError?: boolean; runId?: string; run?: 
     `agent: ${result.run.agent}`,
     `status: ${result.run.status}`,
     `context: ${result.run.contextMode}`,
+    `model: ${result.run.model || "inherited"}`,
+    `thinking: ${result.run.thinking || "inherited"}`,
     `cwd: ${result.run.cwd}`,
     `startedAt: ${result.run.startedAt}`,
   ];
@@ -1479,6 +1545,7 @@ function finalizeRunArtifacts(record: RunRecord, output: string, stderr: string)
     `- context: ${record.contextMode}`,
     `- cwd: ${record.cwd}`,
     record.model ? `- model: ${record.model}` : undefined,
+    record.thinking ? `- thinking: ${record.thinking}` : undefined,
     record.childSessionFile ? `- childSessionFile: ${record.childSessionFile}` : undefined,
     "",
     "## Task",
@@ -1823,7 +1890,8 @@ function renderInspector(record: RunRecord, width: number, theme: any, scroll: n
     truncateToWidth(`  ${theme.fg("accent", record.agent)} · ${colorStatus(theme, record.status)} · ${formatElapsed(record)}`, width),
     truncateToWidth(`  runId: ${record.runId}`, width),
     truncateToWidth(`  context: ${record.contextMode}`, width),
-    truncateToWidth(`  model: ${record.model || "default"}`, width),
+    truncateToWidth(`  model: ${record.model || "inherited"}`, width),
+    truncateToWidth(`  thinking: ${record.thinking || "inherited"}`, width),
     truncateToWidth(`  cwd: ${record.cwd}`, width),
     record.childSessionFile ? truncateToWidth(`  childSession: ${record.childSessionFile}`, width) : "",
     record.groupId ? truncateToWidth(`  group: ${record.groupId}`, width) : "",
@@ -1878,6 +1946,31 @@ function truncateFromEnd(value: string, max: number): string {
   if (value.length <= max) return value;
   return `…${value.slice(Math.max(0, value.length - max + 1))}`;
 }
+
+function normalizeToolList(tools: string[] | undefined): string[] | undefined {
+  if (!tools) return undefined;
+  const mapped = tools
+    .map((tool) => CLAUDE_TO_PI_TOOL[tool] === undefined ? tool : CLAUDE_TO_PI_TOOL[tool])
+    .filter((tool): tool is string => typeof tool === "string" && tool.trim().length > 0)
+    .map((tool) => tool.trim());
+  return uniqueStrings(mapped);
+}
+
+const CLAUDE_TO_PI_TOOL: Record<string, string | null> = {
+  Read: "read",
+  Write: "write",
+  Edit: "edit",
+  MultiEdit: "edit",
+  Bash: "bash",
+  Grep: "grep",
+  Glob: "find",
+  LS: "ls",
+  Task: null,
+  TodoWrite: null,
+  WebFetch: null,
+  WebSearch: null,
+  AskUserQuestion: null,
+};
 
 function parseMarkdownAgent(raw: string): { frontmatter: JsonObject; body: string } | null {
   if (!raw.startsWith("---\n")) return null;
@@ -2094,8 +2187,7 @@ function asNonEmptyString(value: Json | undefined): string | undefined {
 
 function asStringArray(value: Json | undefined): string[] | undefined {
   if (!Array.isArray(value)) return undefined;
-  const items = value.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim());
-  return items.length > 0 ? items : undefined;
+  return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim());
 }
 
 function asPositiveInteger(value: Json | undefined): number | undefined {

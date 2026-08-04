@@ -6,6 +6,10 @@
   "additionalProperties": false,
   "properties": {
     "$schema": { "type": "string" },
+    "defaults": {
+      "$ref": "#/$defs/agentOverride",
+      "description": "Extension-owned default child runtime policy. model/thinking/fallbackModels are ignored here so this cannot become Pi model settings v2. Missing per-agent model/thinking inherits the parent Pi session."
+    },
     "agentOverrides": {
       "type": "object",
       "additionalProperties": {
@@ -13,7 +17,6 @@
       }
     }
   },
-  "required": ["agentOverrides"],
   "$defs": {
     "turnBudget": {
       "type": "object",
@@ -28,14 +31,15 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "model": { "type": "string", "minLength": 1 },
+        "model": { "type": "string", "minLength": 1, "description": "Per-agent model pin. Omit to inherit the parent Pi session model." },
         "fallbackModels": {
           "type": "array",
           "items": { "type": "string", "minLength": 1 }
         },
-        "thinking": { "type": "string", "minLength": 1 },
+        "thinking": { "type": "string", "minLength": 1, "description": "Per-agent thinking pin. Omit to inherit the parent Pi session thinking level." },
         "tools": {
           "type": "array",
+          "description": "Pi child tool allowlist. This replaces/ignores Claude-agent markdown tools; use Pi registered tool names only.",
           "items": { "type": "string", "minLength": 1 }
         },
         "defaultContext": { "enum": ["fresh", "fork"] },

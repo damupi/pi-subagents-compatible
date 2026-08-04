@@ -113,7 +113,7 @@ This repo includes a `package.json` with a `pi.extensions` manifest so it can be
 This extension uses:
 
 - layered agent directories with scope precedence
-- a local overrides config
+- a local JSONC runtime-policy config
 - a run-artifacts directory
 
 Agent resolution precedence is:
@@ -141,6 +141,14 @@ export PI_SUBAGENT_RUNS_DIR="$HOME/.pi/agent/extensions/pi-subagent/runs"
 ```
 
 ### Local config
+
+`overrides.jsonc` is an extension-owned **child runtime policy**, not Pi model settings v2.
+
+- Omit `model` to inherit the active parent Pi session model.
+- Omit `thinking` to inherit the active parent Pi session thinking level.
+- Pin `model` / `thinking` only for intentional per-agent exceptions.
+- Use `tools` as the Pi child tool allowlist. This replaces Claude-imported markdown `tools:` values for subagent runs.
+- Keep Pi-wide defaults such as `defaultModel` and `defaultThinkingLevel` in Pi `settings.json`, not here.
 
 Default context guidance in the example config:
 

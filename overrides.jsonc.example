@@ -1,31 +1,41 @@
 {
   "$schema": "./overrides.schema.json",
+
+  // Extension-owned child runtime policy.
+  // Missing model/thinking means: inherit the active parent Pi session values.
+  // Do not put Pi defaultModel/defaultThinkingLevel here; use Pi settings for those.
+  "defaults": {
+    "tools": ["read", "grep", "find", "ls"],
+    "defaultContext": "fresh",
+    "maxSubagentDepth": 1
+  },
+
   "agentOverrides": {
     "google-analyst": {
-      "model": "anthropic/claude-sonnet-4",
-      "tools": ["read", "bash", "write", "web_search", "mcp"],
-      "defaultContext": "fork",
-      "maxSubagentDepth": 1
+      "tools": ["read", "bash", "grep", "find", "ls"],
+      "defaultContext": "fork"
     },
+
     "gtm-admin": {
-      "model": "anthropic/claude-sonnet-4",
-      "tools": ["read", "bash", "write", "edit", "mcp"],
+      "tools": ["read", "bash", "write", "edit", "grep", "find", "ls"],
       "timeoutMs": 1800000,
-      "defaultContext": "fork",
-      "maxSubagentDepth": 1
+      "defaultContext": "fork"
     },
+
     "maribel": {
-      "model": "anthropic/claude-sonnet-4",
-      "tools": ["read", "bash", "mcp"],
-      "defaultContext": "fork",
-      "maxSubagentDepth": 1
+      // Maribel's markdown may come from Claude and include Claude-only tools.
+      // This Pi runtime allowlist replaces those values for child runs.
+      "tools": ["read", "grep", "find", "ls"],
+      "defaultContext": "fork"
     },
+
     "researcher": {
+      // Example of an intentional per-agent pin. Remove model/thinking to inherit parent Pi.
       "model": "openai-codex/gpt-5.4",
-      "tools": ["read", "write", "web_search", "fetch_content", "get_search_content", "mcp"],
+      "thinking": "medium",
+      "tools": ["read", "write", "grep", "find", "ls"],
       "defaultContext": "fresh",
-      "timeoutMs": 1800000,
-      "maxSubagentDepth": 1
+      "timeoutMs": 1800000
     }
   }
 }
