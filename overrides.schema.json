@@ -84,7 +84,20 @@
         "defaultProgress": { "type": "string" },
         "toolBudget": { "type": "integer", "minimum": 1 },
         "async": { "type": "boolean" },
-        "disabled": { "type": "boolean" }
+        "disabled": { "type": "boolean" },
+        "unset": {
+          "type": "array",
+          "description": "Remove inherited properties from lower-precedence policy layers.",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "model", "fallbackModels", "thinking", "tools", "defaultContext", "timeoutMs", "turnBudget", "maxSubagentDepth",
+              "systemPrompt", "systemPromptMode", "description", "extensions", "subagentOnlyExtensions", "skills", "inheritProjectContext",
+              "inheritSkills", "acceptance", "acceptanceRole", "completionGuard", "interactive", "memory", "output", "defaultReads",
+              "defaultProgress", "toolBudget", "async", "disabled"
+            ]
+          }
+        }
       }
     }
   }

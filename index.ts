@@ -1,8 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Key, Text, isKeyRelease, matchesKey, truncateToWidth, type EditorComponent } from "@earendil-works/pi-tui";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, type Dirent } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -85,6 +85,12 @@ type OverrideConfig = {
   toolBudget?: number;
   async?: boolean;
   disabled?: boolean;
+};
+
+type NormalizedOverrideConfig = OverrideConfig & { unset?: Array<keyof OverrideConfig> };
+type RuntimePolicyLayer = {
+  defaults: NormalizedOverrideConfig;
+  agentOverrides: Record<string, NormalizedOverrideConfig>;
 };
 
 type AgentDef = {
@@ -176,9 +182,20 @@ type ChildPlan = {
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 const ENV_AGENT_DIR = process.env.PI_SUBAGENT_AGENT_DIR?.trim() ? resolve(process.env.PI_SUBAGENT_AGENT_DIR.trim()) : undefined;
 const CONFIG_PATH = resolveConfiguredPath(process.env.PI_SUBAGENT_CONFIG_PATH, join(EXTENSION_DIR, "overrides.jsonc"));
+const PROJECT_CONFIG_RELATIVE_PATH = join(".pi", "subagent-overrides.jsonc");
 const SCHEMA_PATH = join(EXTENSION_DIR, "overrides.schema.json");
 const RUNS_DIR = resolveConfiguredPath(process.env.PI_SUBAGENT_RUNS_DIR, join(EXTENSION_DIR, "runs"));
 const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
+const DEFAULT_RUN_RETENTION_DAYS = 7;
+const RUN_RETENTION_DAYS = parseRunRetentionDays(process.env.PI_SUBAGENT_RUN_RETENTION_DAYS);
+const RUN_PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+const RUN_ARTIFACT_MARKER = ".pi-subagent-run.json";
+const OVERRIDE_KEYS = new Set<keyof OverrideConfig>([
+  "model", "fallbackModels", "thinking", "tools", "defaultContext", "timeoutMs", "turnBudget", "maxSubagentDepth",
+  "systemPrompt", "systemPromptMode", "description", "extensions", "subagentOnlyExtensions", "skills", "inheritProjectContext",
+  "inheritSkills", "acceptance", "acceptanceRole", "completionGuard", "interactive", "memory", "output", "defaultReads",
+  "defaultProgress", "toolBudget", "async", "disabled",
+]);
 const FORK_CONTEXT_LINES = 16;
 const COMPLETED_UI_GRACE_MS = 15_000;
 const FLEET_REFRESH_MS = 500;
@@ -202,6 +219,7 @@ export default function (pi: ExtensionAPI) {
   let uiCtx: any;
   let uiInputUnsubscribe: (() => void) | undefined;
   let uiRefreshTimer: ReturnType<typeof setInterval> | undefined;
+  let runPruneTimer: ReturnType<typeof setInterval> | undefined;
   let widgetRegistered = false;
   let widgetTui: any;
   let footerRegistered = false;
@@ -211,6 +229,7 @@ export default function (pi: ExtensionAPI) {
   let selectedKey = "main";
   let currentSessionId: string | undefined;
   let currentProjectCwd = process.cwd();
+  let lastStatusText: string | undefined;
 
   function refresh(cwd?: string) {
     if (cwd) currentProjectCwd = cwd;
@@ -227,7 +246,10 @@ export default function (pi: ExtensionAPI) {
     const failed = runs.filter((run) => run.status === "failed" || run.status === "spawn_error" || run.status === "timed_out").length;
     const text = [`subagents:${agents.length}`, `runs:${running}`];
     if (failed > 0) text.push(`issues:${failed}`);
-    target.ui.setStatus("pi-subagent", text.join(" "));
+    const nextStatusText = text.join(" ");
+    if (nextStatusText === lastStatusText) return;
+    lastStatusText = nextStatusText;
+    target.ui.setStatus("pi-subagent", nextStatusText);
   }
 
   function visibleFleetEntries() {
@@ -237,6 +259,13 @@ export default function (pi: ExtensionAPI) {
   function updateUiWidget(ctx?: any) {
     const target = ctx || uiCtx;
     if (!target) return;
+
+    if (visibleFleetEntries().length === 0) {
+      if (widgetRegistered) target.ui.setWidget(FLEET_WIDGET_KEY, undefined);
+      widgetRegistered = false;
+      widgetTui = undefined;
+      return;
+    }
 
     if (!widgetRegistered) {
       target.ui.setWidget(FLEET_WIDGET_KEY, (tui: any, theme: any) => {
@@ -304,13 +333,17 @@ export default function (pi: ExtensionAPI) {
   function cleanupUi() {
     if (uiRefreshTimer) clearInterval(uiRefreshTimer);
     uiRefreshTimer = undefined;
+    if (runPruneTimer) clearInterval(runPruneTimer);
+    runPruneTimer = undefined;
     if (uiInputUnsubscribe) uiInputUnsubscribe();
     uiInputUnsubscribe = undefined;
     if (uiCtx) {
       try { uiCtx.ui.setWidget(FLEET_WIDGET_KEY, undefined); } catch {}
       try { uiCtx.ui.setWidget(LEGACY_WIDGET_KEY, undefined); } catch {}
       try { uiCtx.ui.setFooter(undefined); } catch {}
+      try { uiCtx.ui.setStatus("pi-subagent", undefined); } catch {}
     }
+    lastStatusText = undefined;
     fleetEntries.clear();
     widgetRegistered = false;
     widgetTui = undefined;
@@ -424,6 +457,13 @@ export default function (pi: ExtensionAPI) {
     uiCtx = ctx;
     currentSessionId = getSessionId(ctx) || undefined;
     currentProjectCwd = ctx.cwd || process.cwd();
+    const pruneResult = pruneExpiredRunArtifacts(Date.now(), getProtectedRunIds(activeRuns));
+    if (pruneResult.deleted.length > 0 && ctx.hasUI) {
+      ctx.ui.notify(`Pruned ${pruneResult.deleted.length} subagent run artifact director${pruneResult.deleted.length === 1 ? "y" : "ies"} older than ${RUN_RETENTION_DAYS} days.`, "info");
+    }
+    if (pruneResult.errors.length > 0 && ctx.hasUI) {
+      ctx.ui.notify(`Could not prune ${pruneResult.errors.length} subagent run artifact director${pruneResult.errors.length === 1 ? "y" : "ies"}.`, "warning");
+    }
     reconcileStoredRuns();
     if (ctx.hasUI && typeof ctx.ui.onTerminalInput === "function") {
       uiInputUnsubscribe = ctx.ui.onTerminalInput((data: string) => handleTerminalKey(data));
@@ -433,6 +473,10 @@ export default function (pi: ExtensionAPI) {
       refreshUi();
     }, FLEET_REFRESH_MS);
     uiRefreshTimer.unref?.();
+    runPruneTimer = setInterval(() => {
+      pruneExpiredRunArtifacts(Date.now(), getProtectedRunIds(activeRuns));
+    }, RUN_PRUNE_INTERVAL_MS);
+    runPruneTimer.unref?.();
     refresh(ctx.cwd);
     deliverPendingNotifications(pi, currentSessionId);
     refreshUi(ctx);
@@ -561,22 +605,22 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      refresh(ctx.cwd);
       const currentDepth = Number.parseInt(process.env[DEPTH_ENV] || "0", 10) || 0;
       const parentSessionId = getSessionId(ctx) || undefined;
       const parentSessionFile = getSessionFile(ctx) || undefined;
-      const contextMode: ContextMode = input.context || "fresh";
+      const requestedContext: ContextMode | undefined = input.context;
 
       if (input.chain?.length) {
-        const steps = resolveRequestedTasks(agents, input.chain, currentDepth);
+        const runCwd = input.cwd || ctx.cwd;
+        const steps = resolveRequestedTasks(input.chain, currentDepth, runCwd);
         if (steps.error) return toolError(steps.error);
         if (input.async) {
           return toolError("Async chain orchestration is not implemented yet; run the chain in foreground for now.");
         }
         const result = await runChainForeground(pi, steps.value, {
-          cwd: input.cwd || ctx.cwd,
+          cwd: runCwd,
           depth: currentDepth + 1,
-          context: contextMode,
+          context: requestedContext,
           parentSessionId,
           parentSessionFile,
         }, ctx);
@@ -589,7 +633,8 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (input.tasks?.length) {
-        const steps = resolveRequestedTasks(agents, input.tasks, currentDepth);
+        const runCwd = input.cwd || ctx.cwd;
+        const steps = resolveRequestedTasks(input.tasks, currentDepth, runCwd);
         if (steps.error) return toolError(steps.error);
         const groupId = createRunId("parallel");
         if (input.async) {
@@ -600,7 +645,7 @@ export default function (pi: ExtensionAPI) {
             cwd: step.cwd || input.cwd || ctx.cwd,
             timeoutMs: step.timeoutMs || input.timeoutMs,
             depth: currentDepth + 1,
-            context: contextMode,
+            context: requestedContext || step.agent.override.defaultContext || "fresh",
             parentSessionId,
             parentSessionFile,
             groupId,
@@ -615,9 +660,9 @@ export default function (pi: ExtensionAPI) {
           };
         }
         const result = await runParallelForeground(steps.value, {
-          cwd: input.cwd || ctx.cwd,
+          cwd: runCwd,
           depth: currentDepth + 1,
-          context: contextMode,
+          context: requestedContext,
           parentSessionId,
           parentSessionFile,
         }, ctx);
@@ -633,8 +678,9 @@ export default function (pi: ExtensionAPI) {
         return toolError("Missing task. Pass { agent, task }.");
       }
 
-      const agent = resolveAgent(agents, input.agent || "");
-      if (!agent) return toolError(`Unknown agent '${input.agent}'. Run subagent({ action: 'list' }) first.`);
+      const runCwd = input.cwd || ctx.cwd;
+      const agent = resolveAgent(loadAgents(runCwd), input.agent || "");
+      if (!agent) return toolError(`Unknown agent '${input.agent}' for cwd '${runCwd}'. Run subagent({ action: 'list' }) from that project first.`);
       const maxDepth = agent.override.maxSubagentDepth;
       if (typeof maxDepth === "number" && currentDepth >= maxDepth) {
         return toolError(`Blocked: agent '${agent.runtimeName}' reached maxSubagentDepth ${maxDepth}.`);
@@ -644,7 +690,7 @@ export default function (pi: ExtensionAPI) {
         task: input.task,
         model: input.model,
         thinking: input.thinking,
-        cwd: input.cwd || ctx.cwd,
+        cwd: runCwd,
         timeoutMs: input.timeoutMs,
         depth: currentDepth + 1,
         context: input.context || agent.override.defaultContext || "fresh",
@@ -698,14 +744,15 @@ function toolError(text: string) {
 }
 
 function resolveRequestedTasks(
-  agents: AgentDef[],
   tasks: Array<{ agent: string; task: string; model?: string; thinking?: string; cwd?: string; timeoutMs?: number }>,
   currentDepth: number,
+  defaultCwd: string,
 ): { value: Array<{ agent: AgentDef; task: string; model?: string; thinking?: string; cwd?: string; timeoutMs?: number }>; error?: undefined } | { value?: undefined; error: string } {
   const resolved: Array<{ agent: AgentDef; task: string; model?: string; thinking?: string; cwd?: string; timeoutMs?: number }> = [];
   for (const task of tasks) {
-    const agent = resolveAgent(agents, task.agent);
-    if (!agent) return { error: `Unknown agent '${task.agent}'.` };
+    const effectiveCwd = task.cwd || defaultCwd;
+    const agent = resolveAgent(loadAgents(effectiveCwd), task.agent);
+    if (!agent) return { error: `Unknown agent '${task.agent}' for cwd '${effectiveCwd}'.` };
     const maxDepth = agent.override.maxSubagentDepth;
     if (typeof maxDepth === "number" && currentDepth >= maxDepth) {
       return { error: `Blocked: agent '${agent.runtimeName}' reached maxSubagentDepth ${maxDepth}.` };
@@ -717,7 +764,7 @@ function resolveRequestedTasks(
 
 async function runParallelForeground(
   steps: Array<{ agent: AgentDef; task: string; model?: string; thinking?: string; cwd?: string; timeoutMs?: number }>,
-  options: { cwd: string; depth: number; context: ContextMode; parentSessionId?: string; parentSessionFile?: string },
+  options: { cwd: string; depth: number; context?: ContextMode; parentSessionId?: string; parentSessionFile?: string },
   ctx: any,
 ) {
   const results = await Promise.all(steps.map((step) => runChildAgentForeground(step.agent, {
@@ -727,7 +774,7 @@ async function runParallelForeground(
     cwd: step.cwd || options.cwd,
     timeoutMs: step.timeoutMs,
     depth: options.depth,
-    context: options.context,
+    context: options.context || step.agent.override.defaultContext || "fresh",
     parentSessionId: options.parentSessionId,
     parentSessionFile: options.parentSessionFile,
   }, ctx)));
@@ -745,7 +792,7 @@ async function runParallelForeground(
 async function runChainForeground(
   pi: ExtensionAPI,
   steps: Array<{ agent: AgentDef; task: string; model?: string; thinking?: string; cwd?: string; timeoutMs?: number }>,
-  options: { cwd: string; depth: number; context: ContextMode; parentSessionId?: string; parentSessionFile?: string },
+  options: { cwd: string; depth: number; context?: ContextMode; parentSessionId?: string; parentSessionFile?: string },
   ctx: any,
 ) {
   const results: Array<{ index: number; agent: string; task: string; output: string; exitCode: number; elapsedMs: number; timedOut: boolean; model?: string; attemptedModels: string[]; command: string[]; timeoutMs?: number; contextMode: ContextMode; childSessionFile?: string }> = [];
@@ -762,7 +809,7 @@ async function runChainForeground(
       cwd: step.cwd || options.cwd,
       timeoutMs: step.timeoutMs,
       depth: options.depth,
-      context: options.context,
+      context: options.context || step.agent.override.defaultContext || "fresh",
       parentSessionId: options.parentSessionId,
       parentSessionFile: options.parentSessionFile,
       stepIndex: index,
@@ -777,7 +824,7 @@ async function runChainForeground(
 }
 
 function loadAgents(projectCwd = process.cwd()): AgentDef[] {
-  const { defaults, agentOverrides } = loadRuntimePolicy();
+  const policyLayers = loadRuntimePolicy(projectCwd);
   const resolved = new Map<string, AgentDef>();
 
   for (const dir of getAgentSourceDirs(projectCwd)) {
@@ -791,7 +838,7 @@ function loadAgents(projectCwd = process.cwd()): AgentDef[] {
       if (!name) continue;
       const packageName = asNonEmptyString(parsed.frontmatter.package);
       const runtimeName = packageName ? `${packageName}.${name}` : name;
-      const override = mergeOverrides(defaults, normalizeOverride(agentOverrides[runtimeName] ?? agentOverrides[name] ?? {}));
+      const override = resolveRuntimeOverride(policyLayers, runtimeName, name);
       if (override.disabled === true) continue;
       resolved.set(runtimeName, {
         name,
@@ -808,18 +855,45 @@ function loadAgents(projectCwd = process.cwd()): AgentDef[] {
   return Array.from(resolved.values()).sort((a, b) => a.runtimeName.localeCompare(b.runtimeName));
 }
 
-function loadRuntimePolicy(): { defaults: OverrideConfig; agentOverrides: Record<string, JsonObject> } {
-  if (!existsSync(CONFIG_PATH)) return { defaults: {}, agentOverrides: {} };
-  const parsed = parseJsonc(readFileSync(CONFIG_PATH, "utf8"));
-  const rawDefaults = parsed.defaults;
-  const rawOverrides = parsed.agentOverrides;
-  return {
-    defaults: rawDefaults && typeof rawDefaults === "object" && !Array.isArray(rawDefaults) ? normalizeDefaultsPolicy(rawDefaults as JsonObject) : {},
-    agentOverrides: rawOverrides && typeof rawOverrides === "object" && !Array.isArray(rawOverrides) ? rawOverrides as Record<string, JsonObject> : {},
-  };
+function getRuntimePolicyPaths(projectCwd = process.cwd()): string[] {
+  const projectConfigPath = resolve(projectCwd, PROJECT_CONFIG_RELATIVE_PATH);
+  return projectConfigPath === CONFIG_PATH ? [CONFIG_PATH] : [CONFIG_PATH, projectConfigPath];
 }
 
-function normalizeDefaultsPolicy(input: JsonObject): OverrideConfig {
+function loadRuntimePolicy(projectCwd = process.cwd()): RuntimePolicyLayer[] {
+  const layers: RuntimePolicyLayer[] = [];
+
+  for (const configPath of getRuntimePolicyPaths(projectCwd)) {
+    if (!existsSync(configPath)) continue;
+    const parsed = parseJsonc(readFileSync(configPath, "utf8"));
+    const rawDefaults = parsed.defaults;
+    const defaults = rawDefaults && typeof rawDefaults === "object" && !Array.isArray(rawDefaults)
+      ? normalizeDefaultsPolicy(rawDefaults as JsonObject)
+      : {};
+    const agentOverrides: Record<string, NormalizedOverrideConfig> = {};
+    const rawOverrides = parsed.agentOverrides;
+    if (rawOverrides && typeof rawOverrides === "object" && !Array.isArray(rawOverrides)) {
+      for (const [name, rawOverride] of Object.entries(rawOverrides)) {
+        if (!rawOverride || typeof rawOverride !== "object" || Array.isArray(rawOverride)) continue;
+        agentOverrides[name] = normalizeOverride(rawOverride as JsonObject);
+      }
+    }
+    layers.push({ defaults, agentOverrides });
+  }
+
+  return layers;
+}
+
+function resolveRuntimeOverride(layers: RuntimePolicyLayer[], runtimeName: string, name: string): OverrideConfig {
+  let resolved: OverrideConfig = {};
+  for (const layer of layers) {
+    resolved = mergeOverrides(resolved, layer.defaults);
+    resolved = mergeOverrides(resolved, layer.agentOverrides[runtimeName] ?? layer.agentOverrides[name] ?? {});
+  }
+  return resolved;
+}
+
+function normalizeDefaultsPolicy(input: JsonObject): NormalizedOverrideConfig {
   const defaults = normalizeOverride(input);
   delete defaults.model;
   delete defaults.fallbackModels;
@@ -827,22 +901,17 @@ function normalizeDefaultsPolicy(input: JsonObject): OverrideConfig {
   return defaults;
 }
 
-function mergeOverrides(defaults: OverrideConfig, override: OverrideConfig): OverrideConfig {
-  return {
-    ...defaults,
-    ...override,
-    fallbackModels: override.fallbackModels ?? defaults.fallbackModels,
-    tools: override.tools ?? defaults.tools,
-    turnBudget: override.turnBudget ?? defaults.turnBudget,
-    extensions: override.extensions ?? defaults.extensions,
-    subagentOnlyExtensions: override.subagentOnlyExtensions ?? defaults.subagentOnlyExtensions,
-    skills: override.skills ?? defaults.skills,
-    acceptance: override.acceptance ?? defaults.acceptance,
-    defaultReads: override.defaultReads ?? defaults.defaultReads,
-  };
+function mergeOverrides(defaults: OverrideConfig, override: NormalizedOverrideConfig): OverrideConfig {
+  const merged = { ...defaults };
+  for (const [key, value] of Object.entries(override)) {
+    if (key === "unset" || value === undefined) continue;
+    (merged as Record<string, unknown>)[key] = value;
+  }
+  for (const key of override.unset ?? []) delete merged[key];
+  return merged;
 }
 
-function normalizeOverride(input: JsonObject): OverrideConfig {
+function normalizeOverride(input: JsonObject): NormalizedOverrideConfig {
   return {
     model: asNonEmptyString(input.model),
     fallbackModels: asStringArray(input.fallbackModels),
@@ -870,7 +939,8 @@ function normalizeOverride(input: JsonObject): OverrideConfig {
     defaultProgress: asNonEmptyString(input.defaultProgress),
     toolBudget: asPositiveInteger(input.toolBudget),
     async: asBoolean(input.async),
-    disabled: input.disabled === true,
+    disabled: asBoolean(input.disabled),
+    unset: asStringArray(input.unset)?.filter((key): key is keyof OverrideConfig => OVERRIDE_KEYS.has(key as keyof OverrideConfig)),
   };
 }
 
@@ -880,7 +950,7 @@ function renderAgentList(agents: AgentDef[], projectCwd = process.cwd()): string
     return [
       "No subagents found.",
       `agent sources: ${sourceDirs.join(" | ")}`,
-      `config: ${CONFIG_PATH}`,
+      `configs: ${getRuntimePolicyPaths(projectCwd).join(" | ")}`,
       `schema: ${SCHEMA_PATH}`,
     ];
   }
@@ -888,7 +958,8 @@ function renderAgentList(agents: AgentDef[], projectCwd = process.cwd()): string
   const lines = [
     `agent sources: ${sourceDirs.join(" | ")}`,
     `precedence: later sources win (project overrides user)`,
-    `config: ${CONFIG_PATH}`,
+    `configs: ${getRuntimePolicyPaths(projectCwd).join(" | ")}`,
+    `precedence: project config overrides global config`,
     `schema: ${SCHEMA_PATH}`,
     `runs dir: ${RUNS_DIR}`,
     `count: ${agents.length}`,
@@ -959,7 +1030,7 @@ function launchAsyncRun(
   ensureRunsDir();
   const runId = createRunId(agent.runtimeName);
   const runDir = join(RUNS_DIR, runId);
-  mkdirSync(runDir, { recursive: true });
+  createRunArtifactDirectory(runDir, runId, "async");
   const plan = buildChildPlan(agent, options, ctx, runDir);
 
   const record: RunRecord = {
@@ -1089,7 +1160,7 @@ async function runChildAgentForeground(
 ): Promise<{ output: string; exitCode: number; elapsedMs: number; timedOut: boolean; model?: string; thinking?: string; attemptedModels: string[]; timeoutMs?: number; command: string[]; contextMode: ContextMode; childSessionFile?: string }> {
   const runId = createRunId(`${agent.runtimeName}-fg`);
   const runDir = join(RUNS_DIR, runId);
-  mkdirSync(runDir, { recursive: true });
+  createRunArtifactDirectory(runDir, runId, "foreground");
   const candidates = getModelCandidates(agent, options, ctx);
   let lastResult: { output: string; exitCode: number; elapsedMs: number; timedOut: boolean; model?: string; thinking?: string; timeoutMs?: number; command: string[]; contextMode: ContextMode; childSessionFile?: string } | undefined;
   const attempted: string[] = [];
@@ -1118,6 +1189,8 @@ async function runChildAgentForeground(
     const result = await new Promise<{ output: string; exitCode: number; elapsedMs: number; timedOut: boolean; model?: string; thinking?: string; timeoutMs?: number; command: string[]; contextMode: ContextMode; childSessionFile?: string }>((resolveRun) => {
       const startedAt = Date.now();
       const proc = spawn("pi", plan.args, { cwd: options.cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+      const activeMarkerPath = join(runDir, "active.json");
+      writeFileSync(activeMarkerPath, `${JSON.stringify({ kind: "foreground", pid: proc.pid, startedAt: new Date().toISOString() }, null, 2)}\n`, "utf8");
       let timedOut = false;
       let buffer = "";
       const textChunks: string[] = [];
@@ -1149,6 +1222,7 @@ async function runChildAgentForeground(
 
       proc.on("close", (code) => {
         if (timer) clearTimeout(timer);
+        rmSync(activeMarkerPath, { force: true });
         if (buffer.trim()) consumeJsonLine(buffer, textChunks, (activity) => {
           updateFleetActivity(runId, activity);
           emitForegroundUpdate(true);
@@ -1170,6 +1244,7 @@ async function runChildAgentForeground(
 
       proc.on("error", (error) => {
         if (timer) clearTimeout(timer);
+        rmSync(activeMarkerPath, { force: true });
         updateFleetPreview(runId, error.message);
         emitForegroundUpdate(true);
         resolveRun({
@@ -1548,6 +1623,126 @@ function ensureRunsDir() {
   mkdirSync(RUNS_DIR, { recursive: true });
 }
 
+function createRunArtifactDirectory(runDir: string, runId: string, kind: "async" | "foreground") {
+  mkdirSync(runDir, { recursive: true });
+  writeFileSync(join(runDir, RUN_ARTIFACT_MARKER), `${JSON.stringify({ schemaVersion: 1, runId, kind, createdAt: new Date().toISOString() }, null, 2)}\n`, "utf8");
+}
+
+function parseRunRetentionDays(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_RUN_RETENTION_DAYS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_RUN_RETENTION_DAYS;
+}
+
+type RunPruneResult = {
+  deleted: string[];
+  errors: Array<{ runId: string; message: string }>;
+};
+
+function pruneExpiredRunArtifacts(now = Date.now(), protectedRunIds = new Set<string>()): RunPruneResult {
+  const result: RunPruneResult = { deleted: [], errors: [] };
+  if (RUN_RETENTION_DAYS === 0) return result;
+
+  let entries: Dirent[];
+  try {
+    ensureRunsDir();
+    entries = readdirSync(RUNS_DIR, { withFileTypes: true });
+  } catch (error) {
+    result.errors.push({ runId: RUNS_DIR, message: error instanceof Error ? error.message : String(error) });
+    return result;
+  }
+
+  const cutoff = now - RUN_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || protectedRunIds.has(entry.name) || !isExpectedRunDirectoryName(entry.name)) continue;
+    const runDir = join(RUNS_DIR, entry.name);
+
+    try {
+      const metaPath = join(runDir, "meta.json");
+      const ownershipMarkerPath = join(runDir, RUN_ARTIFACT_MARKER);
+      let record: Partial<RunRecord> | undefined;
+      if (existsSync(metaPath)) {
+        try {
+          record = JSON.parse(readFileSync(metaPath, "utf8")) as Partial<RunRecord>;
+        } catch {
+          record = undefined;
+        }
+      }
+      const hasValidMetadata = isValidLegacyRunRecord(record, entry.name);
+      const ownsRunDirectory = hasValidRunArtifactMarker(ownershipMarkerPath, entry.name) || hasValidMetadata;
+      if (!ownsRunDirectory) continue;
+      if (hasValidMetadata && (record?.status === "running" || record?.status === "queued")) continue;
+
+      const activeMarkerPath = join(runDir, "active.json");
+      if (existsSync(activeMarkerPath)) {
+        const marker = JSON.parse(readFileSync(activeMarkerPath, "utf8")) as { pid?: unknown };
+        if (typeof marker.pid === "number" && isPidAlive(marker.pid)) continue;
+      }
+
+      let newestArtifactMtime = statSync(runDir).mtimeMs;
+      for (const artifact of readdirSync(runDir, { withFileTypes: true })) {
+        if (!artifact.isFile()) continue;
+        newestArtifactMtime = Math.max(newestArtifactMtime, statSync(join(runDir, artifact.name)).mtimeMs);
+      }
+      if (newestArtifactMtime >= cutoff) continue;
+
+      rmSync(runDir, { recursive: true, force: true });
+      result.deleted.push(entry.name);
+    } catch (error) {
+      result.errors.push({ runId: entry.name, message: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  return result;
+}
+
+function isValidLegacyRunRecord(record: Partial<RunRecord> | undefined, expectedRunId: string): boolean {
+  if (!record || record.runId !== expectedRunId || record.kind !== "single") return false;
+  if (typeof record.agent !== "string" || record.agent.trim() === "") return false;
+  if (typeof record.task !== "string" || typeof record.cwd !== "string") return false;
+  if (!Array.isArray(record.command) || !record.command.every((argument) => typeof argument === "string")) return false;
+  if (typeof record.sourcePath !== "string" || record.sourcePath.trim() === "") return false;
+  if (record.contextMode !== "fresh" && record.contextMode !== "fork") return false;
+  if (typeof record.startedAt !== "string" || !Number.isFinite(Date.parse(record.startedAt))) return false;
+  if (!isAsyncRunStatus(record.status)) return false;
+  if (!record.notification || (record.notification.state !== "delivered" && record.notification.state !== "undelivered")) return false;
+  return hasExpectedArtifactPath(record.outputPath, expectedRunId, "output.txt")
+    && hasExpectedArtifactPath(record.stderrPath, expectedRunId, "stderr.txt")
+    && hasExpectedArtifactPath(record.metaPath, expectedRunId, "meta.json")
+    && hasExpectedArtifactPath(record.resultSummaryPath, expectedRunId, "result.summary.md")
+    && hasExpectedArtifactPath(record.resultFullPath, expectedRunId, "result.full.md");
+}
+
+function isAsyncRunStatus(status: unknown): status is AsyncRunStatus {
+  return status === "queued" || status === "running" || status === "completed" || status === "failed"
+    || status === "stopped" || status === "timed_out" || status === "spawn_error" || status === "orphaned";
+}
+
+function hasExpectedArtifactPath(path: unknown, expectedRunId: string, expectedFile: string): boolean {
+  return typeof path === "string" && basename(path) === expectedFile && basename(dirname(path)) === expectedRunId;
+}
+
+function hasValidRunArtifactMarker(markerPath: string, expectedRunId: string): boolean {
+  if (!existsSync(markerPath)) return false;
+  try {
+    const marker = JSON.parse(readFileSync(markerPath, "utf8")) as { schemaVersion?: unknown; runId?: unknown };
+    return marker.schemaVersion === 1 && marker.runId === expectedRunId;
+  } catch {
+    return false;
+  }
+}
+
+function getProtectedRunIds(activeRuns: Map<string, ActiveRun>): Set<string> {
+  const protectedRunIds = new Set(activeRuns.keys());
+  for (const entry of fleetEntries.values()) {
+    if (entry.status === "running" || entry.status === "queued") protectedRunIds.add(entry.runId);
+  }
+  return protectedRunIds;
+}
+
+function isExpectedRunDirectoryName(name: string): boolean {
+  return /^.+-\d{14}-[a-z0-9]{6}$/i.test(name);
+}
+
 function createRunId(agentName: string): string {
   const stamp = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
   const suffix = Math.random().toString(36).slice(2, 8);
@@ -1603,9 +1798,15 @@ function persistRunRecord(record: RunRecord) {
 }
 
 function listRunRecords(): RunRecord[] {
-  ensureRunsDir();
   const runs: RunRecord[] = [];
-  for (const entry of readdirSync(RUNS_DIR)) {
+  let entries: string[];
+  try {
+    ensureRunsDir();
+    entries = readdirSync(RUNS_DIR);
+  } catch {
+    return runs;
+  }
+  for (const entry of entries) {
     const metaPath = join(RUNS_DIR, entry, "meta.json");
     if (!existsSync(metaPath)) continue;
     try {

@@ -113,7 +113,7 @@ This repo includes a `package.json` with a `pi.extensions` manifest so it can be
 This extension uses:
 
 - layered agent directories with scope precedence
-- a local JSONC runtime-policy config
+- layered global and project JSONC runtime-policy configs
 - a run-artifacts directory
 
 Agent resolution precedence is:
@@ -131,6 +131,7 @@ Other configurable paths can be overridden with environment variables:
 - `PI_SUBAGENT_AGENT_DIR` — optional highest-precedence extra agent directory
 - `PI_SUBAGENT_CONFIG_PATH`
 - `PI_SUBAGENT_RUNS_DIR`
+- `PI_SUBAGENT_RUN_RETENTION_DAYS` — completed and inactive run artifacts are pruned after this many days; defaults to `7`, and `0` disables pruning
 
 ### Example
 
@@ -138,14 +139,26 @@ Other configurable paths can be overridden with environment variables:
 export PI_SUBAGENT_AGENT_DIR="$HOME/.config/pi-subagent/shared-agents"
 export PI_SUBAGENT_CONFIG_PATH="$HOME/.pi/agent/extensions/pi-subagent/overrides.jsonc"
 export PI_SUBAGENT_RUNS_DIR="$HOME/.pi/agent/extensions/pi-subagent/runs"
+export PI_SUBAGENT_RUN_RETENTION_DAYS="7"
 ```
 
 ### Local config
 
 `overrides.jsonc` is an extension-owned **child runtime policy**, not Pi model settings v2.
 
-- Omit `model` to inherit the active parent Pi session model.
-- Omit `thinking` to inherit the active parent Pi session thinking level.
+Runtime policy is resolved from each child task's effective `cwd`. This also applies to per-task working directories in parallel and chain runs.
+
+For each agent, properties merge in this order:
+
+1. global `defaults`
+2. global matching `agentOverrides` entry
+3. project `defaults` from `<child-cwd>/.pi/subagent-overrides.jsonc`
+4. project matching `agentOverrides` entry
+
+The project config is optional. Higher layers override only the properties they declare, so unrelated lower-layer values remain active. Use `"unset": ["propertyName"]` in a higher layer to remove inherited values explicitly.
+
+- Omit `model` to preserve a lower-layer pin, or inherit the active parent Pi session model when no layer pins it. Use `"unset": ["model"]` to remove a lower-layer pin.
+- Omit `thinking` to preserve a lower-layer pin, or inherit the active parent Pi session thinking level when no layer pins it. Use `"unset": ["thinking"]` to remove a lower-layer pin.
 - Pin `model` / `thinking` only for intentional per-agent exceptions.
 - Use `tools` as the Pi child tool allowlist. This replaces Claude-imported markdown `tools:` values for subagent runs.
 - Keep Pi-wide defaults such as `defaultModel` and `defaultThinkingLevel` in Pi `settings.json`, not here.
@@ -267,6 +280,7 @@ runs/<runId>/
 
 Typical files:
 
+- `.pi-subagent-run.json` — ownership marker used by safe retention cleanup
 - `meta.json`
 - `output.txt`
 - `stderr.txt`
@@ -275,6 +289,18 @@ Typical files:
 - `prompt.md`
 - `task.md`
 - optional `child-session.jsonl`
+
+### Automatic pruning
+
+Run artifacts are pruned automatically at session startup and then hourly. The default retention period is seven days. Pruning:
+
+- skips async runs whose persisted status is `running` or `queued`
+- skips runs active in the current extension process or carrying a live foreground PID marker
+- deletes only directories with a matching Pi subagent ownership marker or validated legacy async metadata
+- uses the newest direct artifact modification time, so recently updated artifacts are retained
+- ignores non-directory and unrelated directory entries in the runs directory
+
+Set `PI_SUBAGENT_RUN_RETENTION_DAYS=0` to disable automatic pruning.
 
 ## TUI behavior
 
