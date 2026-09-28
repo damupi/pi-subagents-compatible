@@ -10,7 +10,7 @@ It:
 - applies Pi-specific runtime overrides from local config
 - provides a `subagent` tool for single-run, async, parallel, and chain workflows
 - persists async run artifacts locally
-- shows lightweight TUI status/inspection UI while runs are active
+- streams foreground progress inside the tool card and shows a fixed-height fleet summary while runs are active
 
 It is **not** the original `pi-subagents` project and does **not** reuse that package at runtime.
 
@@ -53,7 +53,9 @@ Working features include:
 - foreground parallel orchestration
 - foreground chain orchestration
 - async parallel fan-out
-- transient TUI roster/footer while runs are active
+- inline foreground progress for single, parallel, and chain runs
+- fixed-height TUI fleet summary while runs are active
+- foreground cancellation with forced process cleanup when graceful termination stalls
 
 Current limitation:
 
@@ -304,10 +306,11 @@ Set `PI_SUBAGENT_RUN_RETENTION_DAYS=0` to disable automatic pruning.
 
 ## TUI behavior
 
-- roster/widget appears only while there are active or very recent visible runs
-- custom footer appears only while there are visible runs
-- completed runs fade from UI after a short grace period
-- completed members of a parallel group stay visible while siblings are still active
+- foreground progress is rendered inside the active `subagent` tool card
+- expanding the tool card shows bounded per-agent rows for parallel and chain runs
+- the persistent fleet widget is always a single summary line and appears only while work is active
+- the widget has no expandable roster, elapsed clock, or activity preview, avoiding variable-height terminal redraws
+- detailed persisted output remains available through `status`, `/subagent-runs`, and run artifacts
 
 ## Security
 

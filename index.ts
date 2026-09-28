@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { Key, Text, isKeyRelease, matchesKey, truncateToWidth, type EditorComponent } from "@earendil-works/pi-tui";
+import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, type Dirent } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -165,7 +165,9 @@ type RunRequest = {
   stepIndex?: number;
   totalSteps?: number;
   stepLabel?: string;
+  signal?: AbortSignal;
   onUpdate?: (result: any) => void;
+  onSpawnError?: (error: Error) => void;
 };
 
 type ChildPlan = {
@@ -177,6 +179,21 @@ type ChildPlan = {
   contextMode: ContextMode;
   childSessionFile?: string;
   effectiveTask: string;
+};
+
+type ForegroundRunResult = {
+  output: string;
+  exitCode: number;
+  elapsedMs: number;
+  timedOut: boolean;
+  stopped: boolean;
+  model?: string;
+  thinking?: string;
+  attemptedModels: string[];
+  timeoutMs?: number;
+  command: string[];
+  contextMode: ContextMode;
+  childSessionFile?: string;
 };
 
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
@@ -199,8 +216,9 @@ const OVERRIDE_KEYS = new Set<keyof OverrideConfig>([
 const FORK_CONTEXT_LINES = 16;
 const COMPLETED_UI_GRACE_MS = 15_000;
 const FLEET_REFRESH_MS = 500;
-const MAX_FLEET_ROWS = 5;
+const MAX_INLINE_PROGRESS_ROWS = 6;
 const MAX_OUTPUT_PREVIEW_CHARS = 2000;
+const FOREGROUND_KILL_GRACE_MS = 1000;
 const FLEET_WIDGET_KEY = "pi-subagent-fleet";
 const LEGACY_WIDGET_KEY = "pi-subagent-runs";
 const USE_LEGACY_FOOTER = false;
@@ -217,16 +235,13 @@ export default function (pi: ExtensionAPI) {
   let agents = loadAgents();
   const activeRuns = new Map<string, ActiveRun>();
   let uiCtx: any;
-  let uiInputUnsubscribe: (() => void) | undefined;
   let uiRefreshTimer: ReturnType<typeof setInterval> | undefined;
   let runPruneTimer: ReturnType<typeof setInterval> | undefined;
   let widgetRegistered = false;
   let widgetTui: any;
   let footerRegistered = false;
-  let selectorActive = false;
-  let inspectorOpen = false;
-  let inspectorScroll = 0;
-  let selectedKey = "main";
+  let lastWidgetSummary: string | undefined;
+  let widgetSummaryText = "";
   let currentSessionId: string | undefined;
   let currentProjectCwd = process.cwd();
   let lastStatusText: string | undefined;
@@ -260,44 +275,30 @@ export default function (pi: ExtensionAPI) {
     const target = ctx || uiCtx;
     if (!target) return;
 
-    if (visibleFleetEntries().length === 0) {
+    const active = visibleFleetEntries().filter((entry) => entry.status === "running" || entry.status === "queued");
+    if (active.length === 0) {
       if (widgetRegistered) target.ui.setWidget(FLEET_WIDGET_KEY, undefined);
       widgetRegistered = false;
       widgetTui = undefined;
+      lastWidgetSummary = undefined;
+      widgetSummaryText = "";
       return;
     }
+
+    const foreground = active.filter((entry) => entry.kind === "foreground").length;
+    const background = active.length - foreground;
+    const summary = `${active.length}:${foreground}:${background}`;
+    const parts = [`${active.length} active subagent${active.length === 1 ? "" : "s"}`];
+    if (foreground > 0) parts.push(`${foreground} foreground`);
+    if (background > 0) parts.push(`${background} background`);
+    widgetSummaryText = parts.join(" · ");
 
     if (!widgetRegistered) {
       target.ui.setWidget(FLEET_WIDGET_KEY, (tui: any, theme: any) => {
         widgetTui = tui;
         return {
           render(width: number): string[] {
-            const entries = visibleFleetEntries();
-            if (entries.length === 0) return [];
-
-            if (inspectorOpen) {
-              const selected = entries.find((entry) => entry.key === selectedKey);
-              if (!selected) return [];
-              return renderFleetInspector(selected, width, theme, inspectorScroll);
-            }
-
-            const roster = ["main", ...entries.map((entry) => entry.key)];
-            if (!roster.includes(selectedKey)) selectedKey = "main";
-            const selectedIndex = Math.max(0, roster.indexOf(selectedKey));
-            const hint = selectorActive
-              ? "↑↓/jk select · enter inspect · pgup/pgdn scroll · esc back"
-              : "↓ for subagents";
-            const lines = [truncateToWidth(`  ${theme.fg("dim", hint)}`, width), ""];
-            lines.push(renderRosterLine(width, theme, 0, selectedIndex, "main", "main"));
-            for (let index = 0; index < Math.min(entries.length, MAX_FLEET_ROWS); index += 1) {
-              const entry = entries[index]!;
-              lines.push(renderRosterLine(width, theme, index + 1, selectedIndex, entry.key, formatFleetHeadline(entry, theme)));
-              lines.push(truncateToWidth(`    ${theme.fg("dim", formatFleetActivity(entry, width - 6))}`, width));
-            }
-            if (entries.length > MAX_FLEET_ROWS) {
-              lines.push(truncateToWidth(`    ${theme.fg("dim", `+${entries.length - MAX_FLEET_ROWS} more subagents`)}`, width));
-            }
-            return lines;
+            return [truncateToWidth(`  ${theme.fg("muted", widgetSummaryText)}`, width)];
           },
           invalidate() {},
           dispose() {
@@ -307,10 +308,14 @@ export default function (pi: ExtensionAPI) {
         };
       }, { placement: "belowEditor" });
       widgetRegistered = true;
+      lastWidgetSummary = summary;
       return;
     }
 
-    widgetTui?.requestRender();
+    if (summary !== lastWidgetSummary) {
+      lastWidgetSummary = summary;
+      widgetTui?.requestRender();
+    }
   }
 
   function setFooter(ctx?: any) {
@@ -335,8 +340,6 @@ export default function (pi: ExtensionAPI) {
     uiRefreshTimer = undefined;
     if (runPruneTimer) clearInterval(runPruneTimer);
     runPruneTimer = undefined;
-    if (uiInputUnsubscribe) uiInputUnsubscribe();
-    uiInputUnsubscribe = undefined;
     if (uiCtx) {
       try { uiCtx.ui.setWidget(FLEET_WIDGET_KEY, undefined); } catch {}
       try { uiCtx.ui.setWidget(LEGACY_WIDGET_KEY, undefined); } catch {}
@@ -344,110 +347,12 @@ export default function (pi: ExtensionAPI) {
       try { uiCtx.ui.setStatus("pi-subagent", undefined); } catch {}
     }
     lastStatusText = undefined;
+    lastWidgetSummary = undefined;
+    widgetSummaryText = "";
     fleetEntries.clear();
     widgetRegistered = false;
     widgetTui = undefined;
     footerRegistered = false;
-    selectorActive = false;
-    inspectorOpen = false;
-    inspectorScroll = 0;
-    selectedKey = "main";
-  }
-
-  function handleTerminalKey(data: string) {
-    const target = uiCtx;
-    const entries = visibleFleetEntries();
-    if (!target || isKeyRelease(data) || entries.length === 0) return undefined;
-    if (!editorHasFocus(widgetTui)) {
-      if (selectorActive || inspectorOpen) {
-        selectorActive = false;
-        inspectorOpen = false;
-        inspectorScroll = 0;
-        selectedKey = "main";
-        refreshUi();
-      }
-      return undefined;
-    }
-
-    if (inspectorOpen) {
-      if (matchesKey(data, "escape") || matchesKey(data, "left") || matchesKey(data, "h")) {
-        inspectorOpen = false;
-        inspectorScroll = 0;
-        refreshUi();
-        return { consume: true };
-      }
-      if (matchesKey(data, "down") || matchesKey(data, "j")) {
-        inspectorScroll += 1;
-        refreshUi();
-        return { consume: true };
-      }
-      if (matchesKey(data, "up") || matchesKey(data, "k")) {
-        inspectorScroll = Math.max(0, inspectorScroll - 1);
-        refreshUi();
-        return { consume: true };
-      }
-      if (matchesKey(data, "pagedown") || matchesKey(data, "ctrl+f")) {
-        inspectorScroll += 8;
-        refreshUi();
-        return { consume: true };
-      }
-      if (matchesKey(data, "pageup") || matchesKey(data, "ctrl+b")) {
-        inspectorScroll = Math.max(0, inspectorScroll - 8);
-        refreshUi();
-        return { consume: true };
-      }
-      if (matchesKey(data, "g")) {
-        inspectorScroll = 0;
-        refreshUi();
-        return { consume: true };
-      }
-      return undefined;
-    }
-
-    if (!selectorActive) {
-      const activates = matchesKey(data, "down") || matchesKey(data, "left");
-      if (!activates || target.ui.getEditorText() !== "") return undefined;
-      selectorActive = true;
-      selectedKey = entries[0]?.key || "main";
-      refreshUi();
-      return { consume: true };
-    }
-
-    const roster = ["main", ...entries.map((entry) => entry.key)];
-    const selectedIndex = Math.max(0, roster.indexOf(selectedKey));
-    if (matchesKey(data, "down") || matchesKey(data, "j")) {
-      selectedKey = roster[Math.min(roster.length - 1, selectedIndex + 1)] || "main";
-      refreshUi();
-      return { consume: true };
-    }
-    if (matchesKey(data, "up") || matchesKey(data, "k")) {
-      if (selectedIndex === 0) {
-        selectorActive = false;
-        selectedKey = "main";
-      } else {
-        selectedKey = roster[selectedIndex - 1] || "main";
-      }
-      refreshUi();
-      return { consume: true };
-    }
-    if (matchesKey(data, "escape")) {
-      selectorActive = false;
-      selectedKey = "main";
-      refreshUi();
-      return { consume: true };
-    }
-    if (matchesKey(data, Key.enter) || matchesKey(data, "right") || matchesKey(data, "l")) {
-      if (selectedKey === "main") {
-        selectorActive = false;
-      } else {
-        inspectorOpen = true;
-        inspectorScroll = 0;
-      }
-      refreshUi();
-      return { consume: true };
-    }
-
-    return undefined;
   }
 
   refreshExternalUi = () => refreshUi();
@@ -465,9 +370,6 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(`Could not prune ${pruneResult.errors.length} subagent run artifact director${pruneResult.errors.length === 1 ? "y" : "ies"}.`, "warning");
     }
     reconcileStoredRuns();
-    if (ctx.hasUI && typeof ctx.ui.onTerminalInput === "function") {
-      uiInputUnsubscribe = ctx.ui.onTerminalInput((data: string) => handleTerminalKey(data));
-    }
     uiRefreshTimer = setInterval(() => {
       reconcileStoredRuns();
       refreshUi();
@@ -552,7 +454,7 @@ export default function (pi: ExtensionAPI) {
       async: Type.Optional(Type.Boolean({ description: "Run in background and return a runId immediately." })),
       runId: Type.Optional(Type.String({ description: "Async run id for status or stop." })),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const input = params as {
         action?: "list" | "reload" | "status" | "stop";
         agent?: string;
@@ -617,18 +519,21 @@ export default function (pi: ExtensionAPI) {
         if (input.async) {
           return toolError("Async chain orchestration is not implemented yet; run the chain in foreground for now.");
         }
-        const result = await runChainForeground(pi, steps.value, {
+        const result = await runChainForeground(steps.value, {
           cwd: runCwd,
           depth: currentDepth + 1,
           context: requestedContext,
           parentSessionId,
           parentSessionFile,
+          timeoutMs: input.timeoutMs,
+          signal,
+          onUpdate,
         }, ctx);
         refreshUi(ctx);
         return {
           content: [{ type: "text", text: renderChainResult(result) }],
           details: { action: "chain", ...result },
-          isError: result.steps.some((step) => step.exitCode !== 0),
+          isError: result.stopped || result.steps.some((step) => step.exitCode !== 0),
         };
       }
 
@@ -665,12 +570,15 @@ export default function (pi: ExtensionAPI) {
           context: requestedContext,
           parentSessionId,
           parentSessionFile,
+          timeoutMs: input.timeoutMs,
+          signal,
+          onUpdate,
         }, ctx);
         refreshUi(ctx);
         return {
           content: [{ type: "text", text: renderParallelResult(result) }],
           details: { action: "parallel", ...result },
-          isError: result.steps.some((step) => step.exitCode !== 0),
+          isError: result.stopped || result.steps.some((step) => step.exitCode !== 0),
         };
       }
 
@@ -696,7 +604,8 @@ export default function (pi: ExtensionAPI) {
         context: input.context || agent.override.defaultContext || "fresh",
         parentSessionId,
         parentSessionFile,
-        onUpdate: _onUpdate,
+        signal,
+        onUpdate,
       };
 
       if (input.async ?? agent.override.async) {
@@ -724,6 +633,7 @@ export default function (pi: ExtensionAPI) {
           elapsedMs: runResult.elapsedMs,
           exitCode: runResult.exitCode,
           timedOut: runResult.timedOut,
+          stopped: runResult.stopped,
           contextMode: runResult.contextMode,
           childSessionFile: runResult.childSessionFile,
           sourcePath: agent.sourcePath,
@@ -731,6 +641,14 @@ export default function (pi: ExtensionAPI) {
         },
         isError: runResult.exitCode !== 0,
       };
+    },
+
+    renderCall(args, theme) {
+      return renderSubagentToolCall(args, theme);
+    },
+
+    renderResult(result, options, theme) {
+      return renderSubagentToolResult(result, options, theme);
     },
   });
 }
@@ -741,6 +659,86 @@ function toolError(text: string) {
     details: { isError: true },
     isError: true,
   };
+}
+
+function renderSubagentToolCall(args: any, theme: any) {
+  const title = theme.fg("toolTitle", theme.bold("subagent"));
+  if (args.action) {
+    const target = args.runId ? ` ${theme.fg("accent", args.runId)}` : "";
+    return new Text(`${title} ${args.action}${target}`, 0, 0);
+  }
+  if (Array.isArray(args.tasks)) return new Text(`${title} ${theme.fg("accent", `parallel ×${args.tasks.length}`)}${args.async ? theme.fg("warning", " [async]") : ""}`, 0, 0);
+  if (Array.isArray(args.chain)) return new Text(`${title} ${theme.fg("accent", `chain ×${args.chain.length}`)}`, 0, 0);
+  return new Text(`${title} ${theme.fg("accent", args.agent || "?")}${args.async ? theme.fg("warning", " [async]") : ""}`, 0, 0);
+}
+
+function renderSubagentToolResult(result: any, options: { expanded: boolean; isPartial: boolean }, theme: any) {
+  const details = result?.details || {};
+  const progress = Array.isArray(details.progress) ? details.progress : [];
+  if (options.isPartial && progress.length > 0) {
+    const running = progress.filter((item: any) => item.status === "running").length;
+    const queued = progress.filter((item: any) => item.status === "queued").length;
+    const completed = progress.filter((item: any) => item.status === "completed").length;
+    const failed = progress.length - running - queued - completed;
+    const label = details.action === "parallel" ? "Parallel subagents" : details.action === "chain" ? "Subagent chain" : progress[0]?.agent || "Subagent";
+    const summary = [running ? `${running} running` : "", queued ? `${queued} queued` : "", completed ? `${completed} completed` : "", failed ? `${failed} stopped/failed` : ""].filter(Boolean).join(" · ");
+    const lines = [`${theme.fg("accent", "●")} ${theme.bold(label)}${summary ? ` ${theme.fg("dim", `· ${summary}`)}` : ""}`];
+    if (options.expanded) {
+      for (const item of progress.slice(0, MAX_INLINE_PROGRESS_ROWS)) {
+        const glyph = item.status === "completed"
+          ? theme.fg("success", "✓")
+          : item.status === "running"
+            ? theme.fg("accent", "●")
+            : item.status === "queued"
+              ? theme.fg("dim", "○")
+              : theme.fg("warning", "■");
+        const activity = inlineProgressActivity(item);
+        lines.push(`  ${glyph} ${theme.bold(item.agent || "subagent")} ${theme.fg("dim", `· ${item.status}${activity ? ` · ${activity}` : ""}`)}`);
+      }
+      if (progress.length > MAX_INLINE_PROGRESS_ROWS) lines.push(theme.fg("dim", `  +${progress.length - MAX_INLINE_PROGRESS_ROWS} more`));
+    }
+    return new Text(lines.join("\n"), 0, 0);
+  }
+
+  if ((details.action === "parallel" || details.action === "chain") && Array.isArray(details.steps)) {
+    const failed = details.steps.filter((step: any) => step.exitCode !== 0).length;
+    const total = typeof details.totalSteps === "number" ? details.totalSteps : details.steps.length;
+    const completed = details.steps.filter((step: any) => step.exitCode === 0).length;
+    const label = details.action === "parallel" ? "Parallel subagents" : "Subagent chain";
+    const lines = [`${failed ? theme.fg("error", "✗") : theme.fg("success", "✓")} ${theme.bold(label)} ${theme.fg("dim", `· ${completed}/${total} completed${details.stopped ? " · cancelled" : ""}`)}`];
+    if (options.expanded) {
+      for (const step of details.steps.slice(0, MAX_INLINE_PROGRESS_ROWS)) {
+        const status = step.skipped ? "skipped" : step.stopped ? "stopped" : step.timedOut ? "timed out" : step.exitCode === 0 ? "completed" : "failed";
+        const glyph = step.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("warning", "■");
+        lines.push(`  ${glyph} ${theme.bold(step.agent)} ${theme.fg("dim", `· ${status}`)}`);
+      }
+    }
+    return new Text(lines.join("\n"), 0, 0);
+  }
+
+  if (details.action === "run" && details.mode === "foreground") {
+    const status = details.stopped ? "stopped" : details.timedOut ? "timed out" : details.exitCode === 0 ? "completed" : "failed";
+    const glyph = details.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("warning", "■");
+    const lines = [`${glyph} ${theme.bold(details.agent || "Subagent")} ${theme.fg("dim", `· ${status}`)}`];
+    if (options.expanded) {
+      const text = toolResultText(result);
+      if (text) lines.push(...text.split("\n").slice(0, 12).map((line) => `  ${line}`));
+    }
+    return new Text(lines.join("\n"), 0, 0);
+  }
+
+  return new Text(toolResultText(result) || "(no output)", 0, 0);
+}
+
+function inlineProgressActivity(item: any): string {
+  if (item.currentTool) return `${item.currentTool}${item.currentPath ? ` ${item.currentPath}` : item.currentToolArgs ? ` ${item.currentToolArgs}` : ""}`;
+  const preview = typeof item.outputPreview === "string" ? item.outputPreview.split("\n").map((line: string) => line.trim()).filter(Boolean).at(-1) : "";
+  return truncateLine(preview || item.task || "", 90);
+}
+
+function toolResultText(result: any): string {
+  if (!Array.isArray(result?.content)) return "";
+  return result.content.filter((item: any) => item?.type === "text" && typeof item.text === "string").map((item: any) => item.text).join("\n");
 }
 
 function resolveRequestedTasks(
@@ -764,22 +762,62 @@ function resolveRequestedTasks(
 
 async function runParallelForeground(
   steps: Array<{ agent: AgentDef; task: string; model?: string; thinking?: string; cwd?: string; timeoutMs?: number }>,
-  options: { cwd: string; depth: number; context?: ContextMode; parentSessionId?: string; parentSessionFile?: string },
+  options: { cwd: string; depth: number; context?: ContextMode; parentSessionId?: string; parentSessionFile?: string; timeoutMs?: number; signal?: AbortSignal; onUpdate?: (result: any) => void },
   ctx: any,
 ) {
-  const results = await Promise.all(steps.map((step) => runChildAgentForeground(step.agent, {
+  const groupId = createRunId("parallel-fg");
+  const emitGroupUpdate = makeForegroundGroupUpdateEmitter(options.onUpdate, "parallel", groupId, steps.map((step, index) => ({
+    index,
+    agent: step.agent.runtimeName,
+    task: step.task,
+    stepLabel: `parallel ${index + 1}/${steps.length}`,
+  })));
+  emitGroupUpdate(true);
+  const controller = new AbortController();
+  const forwardAbort = () => controller.abort();
+  options.signal?.addEventListener("abort", forwardAbort, { once: true });
+  if (options.signal?.aborted) controller.abort();
+  const promises = steps.map((step, index) => runChildAgentForeground(step.agent, {
     task: step.task,
     model: step.model,
     thinking: step.thinking,
     cwd: step.cwd || options.cwd,
-    timeoutMs: step.timeoutMs,
+    timeoutMs: step.timeoutMs ?? options.timeoutMs,
     depth: options.depth,
     context: options.context || step.agent.override.defaultContext || "fresh",
     parentSessionId: options.parentSessionId,
     parentSessionFile: options.parentSessionFile,
-  }, ctx)));
+    groupId,
+    stepIndex: index,
+    totalSteps: steps.length,
+    stepLabel: `parallel ${index + 1}/${steps.length}`,
+    signal: controller.signal,
+    onUpdate: () => emitGroupUpdate(),
+    onSpawnError: () => controller.abort(),
+  }, ctx).catch((error) => {
+    controller.abort();
+    throw error;
+  }));
+  const settled = await Promise.allSettled(promises);
+  options.signal?.removeEventListener("abort", forwardAbort);
+  const results = settled.map((item, index): ForegroundRunResult => item.status === "fulfilled" ? item.value : {
+    output: item.reason instanceof Error ? item.reason.message : String(item.reason),
+    exitCode: 1,
+    elapsedMs: 0,
+    timedOut: false,
+    stopped: false,
+    model: steps[index]!.model,
+    thinking: steps[index]!.thinking,
+    attemptedModels: [],
+    command: [],
+    contextMode: options.context || steps[index]!.agent.override.defaultContext || "fresh",
+  });
+  emitGroupUpdate(true);
   return {
     mode: "foreground",
+    groupId,
+    totalSteps: steps.length,
+    stopped: Boolean(options.signal?.aborted) || results.some((result) => result.stopped),
     steps: results.map((result, index) => ({
       index,
       agent: steps[index]!.agent.runtimeName,
@@ -790,14 +828,22 @@ async function runParallelForeground(
 }
 
 async function runChainForeground(
-  pi: ExtensionAPI,
   steps: Array<{ agent: AgentDef; task: string; model?: string; thinking?: string; cwd?: string; timeoutMs?: number }>,
-  options: { cwd: string; depth: number; context?: ContextMode; parentSessionId?: string; parentSessionFile?: string },
+  options: { cwd: string; depth: number; context?: ContextMode; parentSessionId?: string; parentSessionFile?: string; timeoutMs?: number; signal?: AbortSignal; onUpdate?: (result: any) => void },
   ctx: any,
 ) {
-  const results: Array<{ index: number; agent: string; task: string; output: string; exitCode: number; elapsedMs: number; timedOut: boolean; model?: string; attemptedModels: string[]; command: string[]; timeoutMs?: number; contextMode: ContextMode; childSessionFile?: string }> = [];
+  const groupId = createRunId("chain-fg");
+  const emitGroupUpdate = makeForegroundGroupUpdateEmitter(options.onUpdate, "chain", groupId, steps.map((step, index) => ({
+    index,
+    agent: step.agent.runtimeName,
+    task: step.task,
+    stepLabel: `chain ${index + 1}/${steps.length}`,
+  })));
+  const results: Array<{ index: number; agent: string; task: string; output: string; exitCode: number; elapsedMs: number; timedOut: boolean; stopped: boolean; skipped?: boolean; model?: string; attemptedModels: string[]; command: string[]; timeoutMs?: number; contextMode: ContextMode; childSessionFile?: string }> = [];
   let previousOutput = "";
+  emitGroupUpdate(true);
   for (let index = 0; index < steps.length; index += 1) {
+    if (options.signal?.aborted) break;
     const step = steps[index]!;
     const task = previousOutput.trim()
       ? `${step.task}\n\nUpstream handoff from previous chain step:\n${truncateLine(previousOutput.trim(), 6000)}`
@@ -807,20 +853,44 @@ async function runChainForeground(
       model: step.model,
       thinking: step.thinking,
       cwd: step.cwd || options.cwd,
-      timeoutMs: step.timeoutMs,
+      timeoutMs: step.timeoutMs ?? options.timeoutMs,
       depth: options.depth,
       context: options.context || step.agent.override.defaultContext || "fresh",
       parentSessionId: options.parentSessionId,
       parentSessionFile: options.parentSessionFile,
+      groupId,
       stepIndex: index,
       totalSteps: steps.length,
       stepLabel: `chain ${index + 1}/${steps.length}`,
+      signal: options.signal,
+      onUpdate: () => emitGroupUpdate(),
     }, ctx);
     results.push({ index, agent: step.agent.runtimeName, task: step.task, ...result });
     previousOutput = result.output;
-    if (result.exitCode !== 0) break;
+    emitGroupUpdate(true);
+    if (result.exitCode !== 0 || result.stopped) break;
   }
-  return { mode: "foreground", steps: results };
+  const stopped = Boolean(options.signal?.aborted) || results.some((result) => result.stopped);
+  for (let index = results.length; index < steps.length; index += 1) {
+    const step = steps[index]!;
+    results.push({
+      index,
+      agent: step.agent.runtimeName,
+      task: step.task,
+      output: stopped ? "Not started because the chain was cancelled." : "Skipped because an earlier chain step failed.",
+      exitCode: 1,
+      elapsedMs: 0,
+      timedOut: false,
+      stopped,
+      skipped: true,
+      model: step.model,
+      attemptedModels: [],
+      command: [],
+      timeoutMs: step.timeoutMs ?? options.timeoutMs,
+      contextMode: options.context || step.agent.override.defaultContext || "fresh",
+    });
+  }
+  return { mode: "foreground", groupId, totalSteps: steps.length, stopped, steps: results };
 }
 
 function loadAgents(projectCwd = process.cwd()): AgentDef[] {
@@ -1157,12 +1227,12 @@ async function runChildAgentForeground(
   agent: AgentDef,
   options: RunRequest,
   ctx: any,
-): Promise<{ output: string; exitCode: number; elapsedMs: number; timedOut: boolean; model?: string; thinking?: string; attemptedModels: string[]; timeoutMs?: number; command: string[]; contextMode: ContextMode; childSessionFile?: string }> {
+): Promise<ForegroundRunResult> {
   const runId = createRunId(`${agent.runtimeName}-fg`);
   const runDir = join(RUNS_DIR, runId);
   createRunArtifactDirectory(runDir, runId, "foreground");
   const candidates = getModelCandidates(agent, options, ctx);
-  let lastResult: { output: string; exitCode: number; elapsedMs: number; timedOut: boolean; model?: string; thinking?: string; timeoutMs?: number; command: string[]; contextMode: ContextMode; childSessionFile?: string } | undefined;
+  let lastResult: Omit<ForegroundRunResult, "attemptedModels"> | undefined;
   const attempted: string[] = [];
 
   for (const candidate of candidates.length > 0 ? candidates : [undefined]) {
@@ -1186,21 +1256,72 @@ async function runChildAgentForeground(
     let emitForegroundUpdate = makeForegroundUpdateEmitter(options.onUpdate, runId);
     emitForegroundUpdate();
     const env = { ...process.env, [DEPTH_ENV]: String(options.depth) };
-    const result = await new Promise<{ output: string; exitCode: number; elapsedMs: number; timedOut: boolean; model?: string; thinking?: string; timeoutMs?: number; command: string[]; contextMode: ContextMode; childSessionFile?: string }>((resolveRun) => {
+    const result = await new Promise<Omit<ForegroundRunResult, "attemptedModels">>((resolveRun) => {
       const startedAt = Date.now();
+      const cancelledResult = (): Omit<ForegroundRunResult, "attemptedModels"> => ({
+        output: "Subagent cancelled.",
+        exitCode: 1,
+        elapsedMs: Date.now() - startedAt,
+        timedOut: false,
+        stopped: true,
+        model: plan.model,
+        thinking: plan.thinking,
+        timeoutMs: plan.timeoutMs,
+        command: plan.args,
+        contextMode: plan.contextMode,
+        childSessionFile: plan.childSessionFile,
+      });
+      if (options.signal?.aborted) {
+        updateFleetStatus(runId, "stopped");
+        resolveRun(cancelledResult());
+        return;
+      }
+
       const proc = spawn("pi", plan.args, { cwd: options.cwd, env, stdio: ["ignore", "pipe", "pipe"] });
       const activeMarkerPath = join(runDir, "active.json");
       writeFileSync(activeMarkerPath, `${JSON.stringify({ kind: "foreground", pid: proc.pid, startedAt: new Date().toISOString() }, null, 2)}\n`, "utf8");
       let timedOut = false;
+      let stopped = false;
+      let settled = false;
       let buffer = "";
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let killTimer: ReturnType<typeof setTimeout> | undefined;
       const textChunks: string[] = [];
       const stderrChunks: string[] = [];
-      const timer = plan.timeoutMs ? setTimeout(() => {
-        timedOut = true;
-        updateFleetStatus(runId, "timed_out");
+
+      const requestTermination = (reason: "stopped" | "timed_out") => {
+        if (settled || stopped || timedOut) return;
+        stopped = reason === "stopped";
+        timedOut = reason === "timed_out";
+        updateFleetStatus(runId, reason);
+        emitForegroundUpdate(true);
         proc.kill("SIGTERM");
-      }, plan.timeoutMs) : null;
-      timer?.unref?.();
+        killTimer = setTimeout(() => {
+          if (!settled && proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
+        }, FOREGROUND_KILL_GRACE_MS);
+        killTimer.unref?.();
+      };
+      const requestStop = () => requestTermination("stopped");
+      options.signal?.addEventListener("abort", requestStop, { once: true });
+      if (options.signal?.aborted) requestStop();
+      if (plan.timeoutMs) {
+        timer = setTimeout(() => requestTermination("timed_out"), plan.timeoutMs);
+        timer.unref?.();
+      }
+
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        if (killTimer) clearTimeout(killTimer);
+        options.signal?.removeEventListener("abort", requestStop);
+        rmSync(activeMarkerPath, { force: true });
+      };
+
+      const settle = (result: Omit<ForegroundRunResult, "attemptedModels">) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolveRun(result);
+      };
 
       proc.stdout.setEncoding("utf8");
       proc.stdout.on("data", (chunk: string) => {
@@ -1221,18 +1342,21 @@ async function runChildAgentForeground(
       });
 
       proc.on("close", (code) => {
-        if (timer) clearTimeout(timer);
-        rmSync(activeMarkerPath, { force: true });
         if (buffer.trim()) consumeJsonLine(buffer, textChunks, (activity) => {
           updateFleetActivity(runId, activity);
           emitForegroundUpdate(true);
         });
-        const output = textChunks.join("").trim() || stderrChunks.join("").trim();
-        resolveRun({
+        const output = stopped
+          ? "Subagent cancelled."
+          : timedOut
+            ? textChunks.join("").trim() || stderrChunks.join("").trim() || "Subagent timed out."
+            : textChunks.join("").trim() || stderrChunks.join("").trim();
+        settle({
           output,
-          exitCode: code ?? 1,
+          exitCode: stopped || timedOut ? 1 : code ?? 1,
           elapsedMs: Date.now() - startedAt,
           timedOut,
+          stopped,
           model: plan.model,
           thinking: plan.thinking,
           timeoutMs: plan.timeoutMs,
@@ -1243,15 +1367,14 @@ async function runChildAgentForeground(
       });
 
       proc.on("error", (error) => {
-        if (timer) clearTimeout(timer);
-        rmSync(activeMarkerPath, { force: true });
         updateFleetPreview(runId, error.message);
         emitForegroundUpdate(true);
-        resolveRun({
+        settle({
           output: error.message,
           exitCode: 1,
           elapsedMs: Date.now() - startedAt,
           timedOut,
+          stopped,
           model: plan.model,
           thinking: plan.thinking,
           timeoutMs: plan.timeoutMs,
@@ -1259,17 +1382,18 @@ async function runChildAgentForeground(
           contextMode: plan.contextMode,
           childSessionFile: plan.childSessionFile,
         });
+        options.onSpawnError?.(error);
       });
     });
 
     if (result.model) attempted.push(result.model);
     lastResult = result;
-    if (result.exitCode === 0 || candidate === candidates[candidates.length - 1]) break;
+    if (result.stopped || result.timedOut || result.exitCode === 0 || candidate === candidates[candidates.length - 1]) break;
     updateFleetPreview(runId, `\nRetrying ${agent.runtimeName} with next model...\n`);
     emitForegroundUpdate(true);
   }
 
-  const finalStatus: FleetEntryStatus = lastResult?.timedOut ? "timed_out" : lastResult?.exitCode === 0 ? "completed" : "failed";
+  const finalStatus: FleetEntryStatus = lastResult?.stopped ? "stopped" : lastResult?.timedOut ? "timed_out" : lastResult?.exitCode === 0 ? "completed" : "failed";
   finishFleetEntry(runId, finalStatus);
   makeForegroundUpdateEmitter(options.onUpdate, runId)(true);
 
@@ -1278,6 +1402,7 @@ async function runChildAgentForeground(
     exitCode: 1,
     elapsedMs: 0,
     timedOut: false,
+    stopped: Boolean(options.signal?.aborted),
     model: candidates[0],
     thinking: resolveThinking(agent, options, ctx),
     timeoutMs: options.timeoutMs || agent.override.timeoutMs,
@@ -1607,16 +1732,23 @@ function renderStopText(result: { isError?: boolean; runId?: string; status?: st
   return result.message;
 }
 
-function renderParallelResult(result: { steps: Array<{ index: number; agent: string; task: string; output: string; exitCode: number }> }): string {
+function renderParallelResult(result: { steps: Array<{ index: number; agent: string; task: string; output: string; exitCode: number; timedOut?: boolean; stopped?: boolean; skipped?: boolean }> }): string {
   return result.steps
-    .map((step) => `## ${step.index + 1}. ${step.agent}\nstatus: ${step.exitCode === 0 ? "completed" : "failed"}\n\n${step.output || "(no output)"}`)
+    .map((step) => `## ${step.index + 1}. ${step.agent}\nstatus: ${foregroundStepStatus(step)}\n\n${step.output || "(no output)"}`)
     .join("\n\n");
 }
 
-function renderChainResult(result: { steps: Array<{ index: number; agent: string; task: string; output: string; exitCode: number }> }): string {
+function renderChainResult(result: { steps: Array<{ index: number; agent: string; task: string; output: string; exitCode: number; timedOut?: boolean; stopped?: boolean; skipped?: boolean }> }): string {
   return result.steps
-    .map((step) => `## Step ${step.index + 1} – ${step.agent}\nstatus: ${step.exitCode === 0 ? "completed" : "failed"}\n\n${step.output || "(no output)"}`)
+    .map((step) => `## Step ${step.index + 1} – ${step.agent}\nstatus: ${foregroundStepStatus(step)}\n\n${step.output || "(no output)"}`)
     .join("\n\n");
+}
+
+function foregroundStepStatus(step: { exitCode: number; timedOut?: boolean; stopped?: boolean; skipped?: boolean }): string {
+  if (step.skipped) return "skipped";
+  if (step.stopped) return "stopped";
+  if (step.timedOut) return "timed_out";
+  return step.exitCode === 0 ? "completed" : "failed";
 }
 
 function ensureRunsDir() {
@@ -1953,7 +2085,9 @@ function makeForegroundUpdateEmitter(onUpdate: ((result: any) => void) | undefin
           progress: [{
             runId: entry.runId,
             agent: entry.agent,
+            task: entry.task,
             status: entry.status,
+            stepLabel: entry.stepLabel,
             currentTool: entry.currentTool,
             currentToolArgs: entry.currentToolArgs,
             currentPath: entry.currentPath,
@@ -1963,6 +2097,57 @@ function makeForegroundUpdateEmitter(onUpdate: ((result: any) => void) | undefin
             outputPreview: entry.outputPreview,
           }],
         },
+      });
+    } catch {
+      // Live tool updates are best-effort; the final tool result still returns normally.
+    }
+  };
+}
+
+function makeForegroundGroupUpdateEmitter(
+  onUpdate: ((result: any) => void) | undefined,
+  action: "parallel" | "chain",
+  groupId: string,
+  manifest: Array<{ index: number; agent: string; task: string; stepLabel: string }>,
+) {
+  let lastEmit = 0;
+  return (force = false) => {
+    if (!onUpdate) return;
+    const now = Date.now();
+    if (!force && now - lastEmit < 250) return;
+    lastEmit = now;
+    const entries = Array.from(fleetEntries.values()).filter((entry) => entry.groupId === groupId);
+    const byIndex = new Map(entries.map((entry) => [entry.stepLabel, entry]));
+    const progress = manifest.map((step) => {
+      const entry = byIndex.get(step.stepLabel);
+      return entry ? {
+        runId: entry.runId,
+        agent: entry.agent,
+        task: entry.task,
+        status: entry.status,
+        stepLabel: entry.stepLabel,
+        currentTool: entry.currentTool,
+        currentToolArgs: entry.currentToolArgs,
+        currentPath: entry.currentPath,
+        turnCount: entry.turnCount,
+        toolCount: entry.toolCount,
+        tokens: entry.tokens,
+        outputPreview: entry.outputPreview,
+      } : {
+        runId: `${groupId}:${step.index}`,
+        agent: step.agent,
+        task: step.task,
+        status: "queued",
+        stepLabel: step.stepLabel,
+      };
+    });
+    const running = progress.filter((item) => item.status === "running").length;
+    const queued = progress.filter((item) => item.status === "queued").length;
+    const completed = progress.filter((item) => item.status === "completed").length;
+    try {
+      onUpdate({
+        content: [{ type: "text", text: `${action === "parallel" ? "Parallel" : "Chain"} subagents: ${running} running, ${queued} queued, ${completed} completed.` }],
+        details: { action, mode: "foreground", groupId, progress },
       });
     } catch {
       // Live tool updates are best-effort; the final tool result still returns normally.
@@ -2080,13 +2265,6 @@ function readPreview(path: string): string {
   return raw.length > 2000 ? `${raw.slice(0, 2000)}\n…` : raw;
 }
 
-function formatFleetHeadline(entry: FleetEntry, theme: any): string {
-  const parts = [entry.agent, colorStatus(theme, entry.status), formatFleetElapsed(entry)];
-  if (entry.kind === "foreground") parts.splice(1, 0, theme.fg("muted", "fg"));
-  if (entry.stepLabel) parts.push(theme.fg("dim", entry.stepLabel));
-  return parts.join(" · ");
-}
-
 function formatFleetActivity(entry: FleetEntry, maxWidth: number): string {
   const parts: string[] = [];
   if (entry.currentTool) {
@@ -2108,39 +2286,6 @@ function formatFleetActivity(entry: FleetEntry, maxWidth: number): string {
   return truncateLine(parts.join(" · "), Math.max(12, maxWidth));
 }
 
-function renderFleetInspector(entry: FleetEntry, width: number, theme: any, scroll: number): string[] {
-  const diskOutput = entry.outputPath ? readPreview(entry.outputPath) : "";
-  const diskStderr = entry.stderrPath ? readPreview(entry.stderrPath) : "";
-  const transcript = (entry.outputPreview || diskOutput || diskStderr || entry.task)
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const lines = [
-    truncateToWidth(`  ${theme.fg("dim", "esc/← back · ↑↓ scroll · pgup/pgdn page")}`, width),
-    "",
-    truncateToWidth(`  ${theme.fg("accent", entry.agent)} · ${entry.kind} · ${colorStatus(theme, entry.status)} · ${formatFleetElapsed(entry)}`, width),
-    truncateToWidth(`  runId: ${entry.runId}`, width),
-    entry.contextMode ? truncateToWidth(`  context: ${entry.contextMode}`, width) : "",
-    truncateToWidth(`  model: ${entry.model || "default"}`, width),
-    truncateToWidth(`  cwd: ${entry.cwd}`, width),
-    entry.childSessionFile ? truncateToWidth(`  childSession: ${entry.childSessionFile}`, width) : "",
-    entry.groupId ? truncateToWidth(`  group: ${entry.groupId}`, width) : "",
-    entry.currentTool ? truncateToWidth(`  currentTool: ${entry.currentTool}${entry.currentToolArgs ? ` ${entry.currentToolArgs}` : ""}`, width) : "",
-    entry.turnCount ? truncateToWidth(`  turns: ${entry.turnCount}`, width) : "",
-    entry.toolCount ? truncateToWidth(`  tools: ${entry.toolCount}`, width) : "",
-    entry.tokens ? truncateToWidth(`  tokens: ${entry.tokens}`, width) : "",
-    entry.artifactPath ? truncateToWidth(`  artifact: ${entry.artifactPath}`, width) : "",
-    "",
-    truncateToWidth(`  task: ${truncateLine(entry.task.replace(/\s+/g, " "), Math.max(10, width - 8))}`, width),
-    "",
-    truncateToWidth("  latest activity", width),
-    ...transcript.map((line) => truncateToWidth(`    ${line}`, width)),
-  ].filter(Boolean);
-  const maxVisible = 22;
-  const clampedScroll = Math.max(0, Math.min(scroll, Math.max(0, lines.length - maxVisible)));
-  return lines.slice(clampedScroll, clampedScroll + maxVisible);
-}
-
 function formatFleetElapsed(entry: FleetEntry): string {
   const end = entry.finishedAtMs || Date.now();
   return `${Math.max(0, Math.round((end - entry.startedAtMs) / 1000))}s`;
@@ -2149,63 +2294,6 @@ function formatFleetElapsed(entry: FleetEntry): string {
 function formatCompactNumber(value: number): string {
   if (value >= 1000) return `${(value / 1000).toFixed(value >= 10_000 ? 0 : 1)}k`;
   return String(value);
-}
-
-function renderRosterLine(width: number, theme: any, rosterIndex: number, selectedIndex: number, _key: string, label: string): string {
-  const bullet = rosterIndex === selectedIndex ? theme.fg("accent", "⏺") : theme.fg("dim", "◯");
-  return truncateToWidth(`  ${bullet} ${label}`, width);
-}
-
-function renderInspector(record: RunRecord, width: number, theme: any, scroll: number): string[] {
-  const output = readPreview(record.outputPath);
-  const stderr = readPreview(record.stderrPath);
-  const transcript = (output || stderr || record.task)
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const lines = [
-    truncateToWidth(`  ${theme.fg("dim", "esc/← back · ↑↓ scroll · pgup/pgdn page")}`, width),
-    "",
-    truncateToWidth(`  ${theme.fg("accent", record.agent)} · ${colorStatus(theme, record.status)} · ${formatElapsed(record)}`, width),
-    truncateToWidth(`  runId: ${record.runId}`, width),
-    truncateToWidth(`  context: ${record.contextMode}`, width),
-    truncateToWidth(`  model: ${record.model || "inherited"}`, width),
-    truncateToWidth(`  thinking: ${record.thinking || "inherited"}`, width),
-    truncateToWidth(`  cwd: ${record.cwd}`, width),
-    record.childSessionFile ? truncateToWidth(`  childSession: ${record.childSessionFile}`, width) : "",
-    record.groupId ? truncateToWidth(`  group: ${record.groupId}`, width) : "",
-    "",
-    truncateToWidth(`  task: ${truncateLine(record.task.replace(/\s+/g, " "), Math.max(10, width - 8))}`, width),
-    "",
-    truncateToWidth(`  latest transcript`, width),
-    ...transcript.map((line) => truncateToWidth(`    ${line}`, width)),
-  ].filter(Boolean);
-  const maxVisible = 22;
-  const clampedScroll = Math.max(0, Math.min(scroll, Math.max(0, lines.length - maxVisible)));
-  return lines.slice(clampedScroll, clampedScroll + maxVisible);
-}
-
-function colorStatus(theme: any, status: AsyncRunStatus): string {
-  if (status === "completed") return theme.fg("success", status);
-  if (status === "running" || status === "queued") return theme.fg("accent", status);
-  if (status === "stopped") return theme.fg("warning", status);
-  return theme.fg("error", status);
-}
-
-function formatElapsed(record: RunRecord): string {
-  if (record.elapsedMs !== undefined) return `${Math.max(0, Math.round(record.elapsedMs / 1000))}s`;
-  return `${Math.max(0, Math.round((Date.now() - Date.parse(record.startedAt)) / 1000))}s`;
-}
-
-function editorHasFocus(tui: any): boolean {
-  const focused = tui?.focusedComponent;
-  if (!focused || typeof focused !== "object") return false;
-  const candidate = focused as Partial<EditorComponent>;
-  return typeof candidate.render === "function"
-    && typeof candidate.invalidate === "function"
-    && typeof candidate.handleInput === "function"
-    && typeof candidate.getText === "function"
-    && typeof candidate.setText === "function";
 }
 
 function latestRecordLine(record: RunRecord): string {
