@@ -9,7 +9,7 @@ It:
 - loads shared agent personas from a configurable agents directory
 - applies Pi-specific runtime overrides from local config
 - provides a `subagent` tool for single-run, async, parallel, and chain workflows
-- persists async run artifacts locally
+- persists foreground and async run artifacts locally
 - streams foreground progress inside the tool card and shows a fixed-height fleet summary while runs are active
 
 It is **not** the original `pi-subagents` project and does **not** reuse that package at runtime.
@@ -56,6 +56,7 @@ Working features include:
 - inline foreground progress for single, parallel, and chain runs
 - fixed-height TUI fleet summary while runs are active
 - foreground cancellation with forced process cleanup when graceful termination stalls
+- `/subagent-inspect` for browsing active and recent persisted runs in a dedicated TUI screen
 
 Current limitation:
 
@@ -274,7 +275,7 @@ Suggested manual tests:
 
 ## Run artifacts
 
-Each async run writes a directory under:
+Each foreground or async run writes a directory under:
 
 ```text
 runs/<runId>/
@@ -296,7 +297,7 @@ Typical files:
 
 Run artifacts are pruned automatically at session startup and then hourly. The default retention period is seven days. Pruning:
 
-- skips async runs whose persisted status is `running` or `queued`
+- skips foreground and async runs whose persisted status is `running` or `queued`
 - skips runs active in the current extension process or carrying a live foreground PID marker
 - deletes only directories with a matching Pi subagent ownership marker or validated legacy async metadata
 - uses the newest direct artifact modification time, so recently updated artifacts are retained
@@ -310,7 +311,9 @@ Set `PI_SUBAGENT_RUN_RETENTION_DAYS=0` to disable automatic pruning.
 - expanding the tool card shows bounded per-agent rows for parallel and chain runs
 - the persistent fleet widget is always a single summary line and appears only while work is active
 - the widget has no expandable roster, elapsed clock, or activity preview, avoiding variable-height terminal redraws
-- detailed persisted output remains available through `status`, `/subagent-runs`, and run artifacts
+- `/subagent-inspect` opens a dedicated keyboard-driven screen for active and recent runs
+- use `↑`/`↓` to select, `Enter` for details, `s` twice to confirm stop, `r` to refresh, and `Esc` to go back or close
+- foreground and background run metadata/output are persisted for inspection through the command, `status`, `/subagent-runs`, and run artifacts
 
 ## Security
 
