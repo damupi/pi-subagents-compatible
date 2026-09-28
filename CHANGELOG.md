@@ -6,6 +6,9 @@
 - Merge policy in global-default → global-agent → project-default → project-agent order, with explicit `unset` support
 - Automatically prune completed and inactive run artifacts after seven days
 - Allow retention override with `PI_SUBAGENT_RUN_RETENTION_DAYS`; set it to `0` to disable pruning
+- Render foreground single, parallel, and chain progress inside the tool card
+- Keep the persistent fleet widget to one fixed-height summary line for Ghostty-safe redraws
+- Cancel foreground children through the tool `AbortSignal`, with SIGTERM-to-SIGKILL escalation
 
 ## 0.1.0
 
