@@ -231,6 +231,23 @@ export default function (pi: ExtensionAPI) {
   let currentProjectCwd = process.cwd();
   let lastStatusText: string | undefined;
   let lastFleetWidgetSignature: string | undefined;
+  let foregroundUiRunCount = 0;
+
+  async function runWithFleetUi<T>(ctx: any, run: () => Promise<T>): Promise<T> {
+    const canControlWorkingRow = typeof ctx?.ui?.setWorkingVisible === "function";
+    foregroundUiRunCount += 1;
+    if (canControlWorkingRow && foregroundUiRunCount === 1) {
+      try { ctx.ui.setWorkingVisible(false); } catch {}
+    }
+    try {
+      return await run();
+    } finally {
+      foregroundUiRunCount = Math.max(0, foregroundUiRunCount - 1);
+      if (canControlWorkingRow && foregroundUiRunCount === 0) {
+        try { ctx.ui.setWorkingVisible(true); } catch {}
+      }
+    }
+  }
 
   function refresh(cwd?: string) {
     if (cwd) currentProjectCwd = cwd;
@@ -353,7 +370,11 @@ export default function (pi: ExtensionAPI) {
       try { uiCtx.ui.setWidget(LEGACY_WIDGET_KEY, undefined); } catch {}
       try { uiCtx.ui.setFooter(undefined); } catch {}
       try { uiCtx.ui.setStatus("pi-subagent", undefined); } catch {}
+      if (foregroundUiRunCount > 0) {
+        try { uiCtx.ui.setWorkingVisible(true); } catch {}
+      }
     }
+    foregroundUiRunCount = 0;
     lastStatusText = undefined;
     lastFleetWidgetSignature = undefined;
     fleetEntries.clear();
@@ -629,13 +650,13 @@ export default function (pi: ExtensionAPI) {
         if (input.async) {
           return toolError("Async chain orchestration is not implemented yet; run the chain in foreground for now.");
         }
-        const result = await runChainForeground(pi, steps.value, {
+        const result = await runWithFleetUi(ctx, () => runChainForeground(pi, steps.value, {
           cwd: runCwd,
           depth: currentDepth + 1,
           context: requestedContext,
           parentSessionId,
           parentSessionFile,
-        }, ctx);
+        }, ctx));
         refreshUi(ctx);
         return {
           content: [{ type: "text", text: renderChainResult(result) }],
@@ -671,13 +692,13 @@ export default function (pi: ExtensionAPI) {
             details: { action: "parallel", mode: "async", groupId, runs: launched.map((item) => item.record) },
           };
         }
-        const result = await runParallelForeground(steps.value, {
+        const result = await runWithFleetUi(ctx, () => runParallelForeground(steps.value, {
           cwd: runCwd,
           depth: currentDepth + 1,
           context: requestedContext,
           parentSessionId,
           parentSessionFile,
-        }, ctx);
+        }, ctx));
         refreshUi(ctx);
         return {
           content: [{ type: "text", text: renderParallelResult(result) }],
@@ -720,7 +741,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const runResult = await runChildAgentForeground(agent, request, ctx);
+      const runResult = await runWithFleetUi(ctx, () => runChildAgentForeground(agent, request, ctx));
       refreshUi(ctx);
       return {
         content: [{ type: "text", text: runResult.output || "(no output)" }],
@@ -779,7 +800,7 @@ async function runParallelForeground(
   options: { cwd: string; depth: number; context?: ContextMode; parentSessionId?: string; parentSessionFile?: string },
   ctx: any,
 ) {
-  const results = await Promise.all(steps.map((step) => runChildAgentForeground(step.agent, {
+  const settled = await Promise.allSettled(steps.map((step) => runChildAgentForeground(step.agent, {
     task: step.task,
     model: step.model,
     thinking: step.thinking,
@@ -790,6 +811,9 @@ async function runParallelForeground(
     parentSessionId: options.parentSessionId,
     parentSessionFile: options.parentSessionFile,
   }, ctx)));
+  const rejected = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (rejected) throw rejected.reason;
+  const results = settled.map((result) => (result as PromiseFulfilledResult<Awaited<ReturnType<typeof runChildAgentForeground>>>).value);
   return {
     mode: "foreground",
     steps: results.map((result, index) => ({
