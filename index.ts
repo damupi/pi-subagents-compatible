@@ -230,6 +230,7 @@ export default function (pi: ExtensionAPI) {
   let currentSessionId: string | undefined;
   let currentProjectCwd = process.cwd();
   let lastStatusText: string | undefined;
+  let lastFleetWidgetSignature: string | undefined;
 
   function refresh(cwd?: string) {
     if (cwd) currentProjectCwd = cwd;
@@ -260,7 +261,17 @@ export default function (pi: ExtensionAPI) {
     const target = ctx || uiCtx;
     if (!target) return;
 
-    if (visibleFleetEntries().length === 0) {
+    const entries = visibleFleetEntries();
+    const nextSignature = getFleetWidgetSignature(entries, {
+      selectorActive,
+      inspectorOpen,
+      inspectorScroll,
+      selectedKey,
+    });
+    const changed = nextSignature !== lastFleetWidgetSignature;
+    lastFleetWidgetSignature = nextSignature;
+
+    if (entries.length === 0) {
       if (widgetRegistered) target.ui.setWidget(FLEET_WIDGET_KEY, undefined);
       widgetRegistered = false;
       widgetTui = undefined;
@@ -310,7 +321,7 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    widgetTui?.requestRender();
+    if (changed) widgetTui?.requestRender();
   }
 
   function setFooter(ctx?: any) {
@@ -344,6 +355,7 @@ export default function (pi: ExtensionAPI) {
       try { uiCtx.ui.setStatus("pi-subagent", undefined); } catch {}
     }
     lastStatusText = undefined;
+    lastFleetWidgetSignature = undefined;
     fleetEntries.clear();
     widgetRegistered = false;
     widgetTui = undefined;
@@ -1824,6 +1836,55 @@ function getVisibleUiRecords(records: RunRecord[], now = Date.now()): RunRecord[
   return records.filter((record) => shouldShowInUi(record, records, now));
 }
 
+function getFileRevision(path?: string): string | undefined {
+  if (!path) return undefined;
+  try {
+    const stats = statSync(path);
+    return `${stats.size}:${stats.mtimeMs}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function getFleetWidgetSignature(
+  entries: FleetEntry[],
+  uiState: { selectorActive: boolean; inspectorOpen: boolean; inspectorScroll: number; selectedKey: string },
+): string {
+  return JSON.stringify({
+    entries: entries.map((entry) => {
+      const isInspected = uiState.inspectorOpen && uiState.selectedKey === entry.key;
+      return {
+        key: entry.key,
+        kind: entry.kind,
+        agent: entry.agent,
+        task: entry.task,
+        status: entry.status,
+        cwd: entry.cwd,
+        contextMode: entry.contextMode,
+        updatedAtMs: entry.updatedAtMs,
+        finishedAtMs: entry.finishedAtMs,
+        model: entry.model,
+        stepLabel: entry.stepLabel,
+        groupId: entry.groupId,
+        outputPreview: entry.outputPreview,
+        currentTool: entry.currentTool,
+        currentToolArgs: entry.currentToolArgs,
+        currentPath: entry.currentPath,
+        turnCount: entry.turnCount,
+        toolCount: entry.toolCount,
+        tokens: entry.tokens,
+        outputPath: entry.outputPath,
+        stderrPath: entry.stderrPath,
+        outputRevision: isInspected ? getFileRevision(entry.outputPath) : undefined,
+        stderrRevision: isInspected ? getFileRevision(entry.stderrPath) : undefined,
+        artifactPath: entry.artifactPath,
+        childSessionFile: entry.childSessionFile,
+      };
+    }),
+    uiState,
+  });
+}
+
 function getVisibleFleetEntries(records: RunRecord[], now = Date.now()): FleetEntry[] {
   const entries = new Map<string, FleetEntry>();
   for (const record of getVisibleUiRecords(records, now)) {
@@ -1866,7 +1927,9 @@ function fleetEntryFromRecord(record: RunRecord, kind: FleetEntryKind): FleetEnt
     cwd: record.cwd,
     contextMode: record.contextMode,
     startedAtMs: Number.isFinite(startedAtMs) ? startedAtMs : existing?.startedAtMs || Date.now(),
-    updatedAtMs: existing?.updatedAtMs || Date.now(),
+    updatedAtMs: existing?.updatedAtMs
+      || (typeof finishedAtMs === "number" && Number.isFinite(finishedAtMs) ? finishedAtMs : undefined)
+      || (Number.isFinite(startedAtMs) ? startedAtMs : Date.now()),
     finishedAtMs: typeof finishedAtMs === "number" && Number.isFinite(finishedAtMs) ? finishedAtMs : existing?.finishedAtMs,
     model: record.model,
     stepLabel: record.stepLabel,
