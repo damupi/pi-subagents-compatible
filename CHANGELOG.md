@@ -6,7 +6,7 @@
 - Merge policy in global-default → global-agent → project-default → project-agent order, with explicit `unset` support
 - Automatically prune completed and inactive run artifacts after seven days
 - Allow retention override with `PI_SUBAGENT_RUN_RETENTION_DAYS`; set it to `0` to disable pruning
-- Prevent repeated `Working` rows in terminal scrollback by deduplicating fleet-widget renders and hiding Pi's built-in working row while foreground fleet progress is visible
+- Prevent repeated foreground progress rows in terminal scrollback by deduplicating renders, hiding Pi's built-in working row, and keeping the idle fleet widget to one stable summary line until inspection is activated
 
 ## 0.1.0
 

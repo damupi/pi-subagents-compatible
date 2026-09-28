@@ -309,13 +309,18 @@ export default function (pi: ExtensionAPI) {
               return renderFleetInspector(selected, width, theme, inspectorScroll);
             }
 
+            if (!selectorActive) {
+              const activeCount = entries.filter((entry) => entry.status === "running" || entry.status === "queued").length;
+              const label = activeCount > 0
+                ? `${activeCount} active subagent${activeCount === 1 ? "" : "s"}`
+                : `${entries.length} recent subagent${entries.length === 1 ? "" : "s"}`;
+              return [truncateToWidth(`  ${theme.fg("muted", label)} · ${theme.fg("dim", "↓/← to inspect")}`, width)];
+            }
+
             const roster = ["main", ...entries.map((entry) => entry.key)];
             if (!roster.includes(selectedKey)) selectedKey = "main";
             const selectedIndex = Math.max(0, roster.indexOf(selectedKey));
-            const hint = selectorActive
-              ? "↑↓/jk select · enter inspect · pgup/pgdn scroll · esc back"
-              : "↓ for subagents";
-            const lines = [truncateToWidth(`  ${theme.fg("dim", hint)}`, width), ""];
+            const lines = [truncateToWidth(`  ${theme.fg("dim", "↑↓/jk select · enter inspect · pgup/pgdn scroll · esc back")}`, width), ""];
             lines.push(renderRosterLine(width, theme, 0, selectedIndex, "main", "main"));
             for (let index = 0; index < Math.min(entries.length, MAX_FLEET_ROWS); index += 1) {
               const entry = entries[index]!;
@@ -1874,6 +1879,13 @@ function getFleetWidgetSignature(
   entries: FleetEntry[],
   uiState: { selectorActive: boolean; inspectorOpen: boolean; inspectorScroll: number; selectedKey: string },
 ): string {
+  if (!uiState.selectorActive && !uiState.inspectorOpen) {
+    return JSON.stringify({
+      activeCount: entries.filter((entry) => entry.status === "running" || entry.status === "queued").length,
+      recentCount: entries.length,
+    });
+  }
+
   return JSON.stringify({
     entries: entries.map((entry) => {
       const isInspected = uiState.inspectorOpen && uiState.selectedKey === entry.key;
