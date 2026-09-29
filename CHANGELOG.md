@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0
+
 - Add layered project runtime policy from `./.pi/subagent-overrides.jsonc`, resolved from each child task's effective working directory
 - Merge policy in global-default → global-agent → project-default → project-agent order, with explicit `unset` support
 - Automatically prune completed and inactive run artifacts after seven days
