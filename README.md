@@ -70,9 +70,13 @@ README.md
 LICENSE
 CHANGELOG.md
 package.json
+package-lock.json
 .gitignore
 overrides.schema.json
 overrides.jsonc.example
+.github/workflows/ci.yml
+test/harness.ts
+test/index.test.ts
 runs/
 ```
 
