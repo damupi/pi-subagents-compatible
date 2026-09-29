@@ -257,7 +257,16 @@ subagent({
 
 ## Testing
 
-After edits:
+Install development dependencies and run the hermetic suite:
+
+```bash
+npm ci
+npm test
+```
+
+The tests use temporary agents, configs, run directories, and a fake child `pi` executable. They do not call models or external services.
+
+After loading local edits:
 
 ```text
 /reload

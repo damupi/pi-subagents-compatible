@@ -4,6 +4,9 @@
   "description": "Claude-compatible subagent workflow for Pi",
   "license": "MIT",
   "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/damupi/pi-subagents-compatible.git"
@@ -39,5 +42,12 @@
     "extensions": [
       "./index.ts"
     ]
+  },
+  "scripts": {
+    "test": "tsx --test --test-concurrency=1 test/index.test.ts",
+    "check": "node --check index.ts && npm test"
+  },
+  "devDependencies": {
+    "tsx": "^4.23.15"
   }
 }

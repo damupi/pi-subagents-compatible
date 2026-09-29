@@ -11,6 +11,8 @@
 - Cancel foreground children through the tool `AbortSignal`, with SIGTERM-to-SIGKILL escalation
 - Add `/subagent-inspect` as a dedicated TUI screen for browsing and stopping active or recent runs
 - Persist foreground metadata and output so completed foreground work remains inspectable
+- Add hermetic lifecycle, cancellation, persistence, inspector, widget, and override regression tests
+- Run the test suite and extension syntax checks in GitHub Actions on Node 22 and 24
 
 ## 0.1.0
 
