@@ -9,6 +9,8 @@
 - Render foreground single, parallel, and chain progress inside the tool card
 - Keep the persistent fleet widget to one fixed-height summary line for Ghostty-safe redraws
 - Cancel foreground children through the tool `AbortSignal`, with SIGTERM-to-SIGKILL escalation
+- Add `/subagent-inspect` as a dedicated TUI screen for browsing and stopping active or recent runs
+- Persist foreground metadata and output so completed foreground work remains inspectable
 
 ## 0.1.0
 

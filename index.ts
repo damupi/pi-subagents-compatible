@@ -1,11 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { Text, truncateToWidth } from "@earendil-works/pi-tui";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync, type Dirent } from "node:fs";
+import { Key, Text, isKeyRelease, isKeyRepeat, matchesKey, stripTerminalSequences, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, rmSync, statSync, writeFileSync, type Dirent } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 type JsonObject = { [key: string]: Json };
@@ -106,6 +106,7 @@ type AgentDef = {
 type RunRecord = {
   runId: string;
   kind: RunKind;
+  executionMode?: FleetEntryKind;
   agent: string;
   task: string;
   cwd: string;
@@ -130,6 +131,7 @@ type RunRecord = {
   resultSummaryPath: string;
   resultFullPath: string;
   pid?: number;
+  processStartedAtMs?: number;
   parentSessionId?: string;
   parentSessionFile?: string;
   childSessionFile?: string;
@@ -151,6 +153,11 @@ type ActiveRun = {
   timer?: ReturnType<typeof setTimeout>;
 };
 
+type LiveRunControl = {
+  record: RunRecord;
+  requestStop: () => void;
+};
+
 type RunRequest = {
   task: string;
   model?: string;
@@ -168,6 +175,7 @@ type RunRequest = {
   signal?: AbortSignal;
   onUpdate?: (result: any) => void;
   onSpawnError?: (error: Error) => void;
+  liveRunControls?: Map<string, LiveRunControl>;
 };
 
 type ChildPlan = {
@@ -183,6 +191,7 @@ type ChildPlan = {
 
 type ForegroundRunResult = {
   output: string;
+  stderr?: string;
   exitCode: number;
   elapsedMs: number;
   timedOut: boolean;
@@ -215,7 +224,7 @@ const OVERRIDE_KEYS = new Set<keyof OverrideConfig>([
 ]);
 const FORK_CONTEXT_LINES = 16;
 const COMPLETED_UI_GRACE_MS = 15_000;
-const FLEET_REFRESH_MS = 500;
+const FLEET_REFRESH_MS = 2000;
 const MAX_INLINE_PROGRESS_ROWS = 6;
 const MAX_OUTPUT_PREVIEW_CHARS = 2000;
 const FOREGROUND_KILL_GRACE_MS = 1000;
@@ -234,12 +243,14 @@ export default function (pi: ExtensionAPI) {
 
   let agents = loadAgents();
   const activeRuns = new Map<string, ActiveRun>();
+  const liveRunControls = new Map<string, LiveRunControl>();
   let uiCtx: any;
   let uiRefreshTimer: ReturnType<typeof setInterval> | undefined;
   let runPruneTimer: ReturnType<typeof setInterval> | undefined;
   let widgetRegistered = false;
   let widgetTui: any;
   let footerRegistered = false;
+  let closeActiveInspector: (() => void) | undefined;
   let lastWidgetSummary: string | undefined;
   let widgetSummaryText = "";
   let currentSessionId: string | undefined;
@@ -252,11 +263,10 @@ export default function (pi: ExtensionAPI) {
     return agents;
   }
 
-  function updateStatus(ctx?: any) {
+  function updateStatus(ctx?: any, runs = listRunRecords()) {
     const target = ctx || uiCtx;
     if (!target) return;
-    const runs = listRunRecords();
-    const fleet = visibleFleetEntries();
+    const fleet = visibleFleetEntries(runs);
     const running = fleet.filter((run) => run.status === "running" || run.status === "queued").length;
     const failed = runs.filter((run) => run.status === "failed" || run.status === "spawn_error" || run.status === "timed_out").length;
     const text = [`subagents:${agents.length}`, `runs:${running}`];
@@ -267,15 +277,15 @@ export default function (pi: ExtensionAPI) {
     target.ui.setStatus("pi-subagent", nextStatusText);
   }
 
-  function visibleFleetEntries() {
-    return getVisibleFleetEntries(listRunRecords());
+  function visibleFleetEntries(records = listRunRecords()) {
+    return getVisibleFleetEntries(records);
   }
 
-  function updateUiWidget(ctx?: any) {
+  function updateUiWidget(ctx?: any, records = listRunRecords()) {
     const target = ctx || uiCtx;
     if (!target) return;
 
-    const active = visibleFleetEntries().filter((entry) => entry.status === "running" || entry.status === "queued");
+    const active = visibleFleetEntries(records).filter((entry) => entry.status === "running" || entry.status === "queued");
     if (active.length === 0) {
       if (widgetRegistered) target.ui.setWidget(FLEET_WIDGET_KEY, undefined);
       widgetRegistered = false;
@@ -291,6 +301,7 @@ export default function (pi: ExtensionAPI) {
     const parts = [`${active.length} active subagent${active.length === 1 ? "" : "s"}`];
     if (foreground > 0) parts.push(`${foreground} foreground`);
     if (background > 0) parts.push(`${background} background`);
+    parts.push("Ctrl+O details · /subagent-inspect");
     widgetSummaryText = parts.join(" · ");
 
     if (!widgetRegistered) {
@@ -330,8 +341,9 @@ export default function (pi: ExtensionAPI) {
 
   function refreshUi(ctx?: any) {
     pruneFleetEntries();
-    updateStatus(ctx);
-    updateUiWidget(ctx);
+    const runs = listRunRecords(100);
+    updateStatus(ctx, runs);
+    updateUiWidget(ctx, runs);
     setFooter(ctx);
   }
 
@@ -340,6 +352,10 @@ export default function (pi: ExtensionAPI) {
     uiRefreshTimer = undefined;
     if (runPruneTimer) clearInterval(runPruneTimer);
     runPruneTimer = undefined;
+    if (closeActiveInspector) {
+      try { closeActiveInspector(); } catch {}
+      closeActiveInspector = undefined;
+    }
     if (uiCtx) {
       try { uiCtx.ui.setWidget(FLEET_WIDGET_KEY, undefined); } catch {}
       try { uiCtx.ui.setWidget(LEGACY_WIDGET_KEY, undefined); } catch {}
@@ -353,6 +369,8 @@ export default function (pi: ExtensionAPI) {
     widgetRegistered = false;
     widgetTui = undefined;
     footerRegistered = false;
+    uiCtx = undefined;
+    refreshExternalUi = () => {};
   }
 
   refreshExternalUi = () => refreshUi();
@@ -360,6 +378,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     cleanupUi();
     uiCtx = ctx;
+    refreshExternalUi = () => refreshUi();
     currentSessionId = getSessionId(ctx) || undefined;
     currentProjectCwd = ctx.cwd || process.cwd();
     const pruneResult = pruneExpiredRunArtifacts(Date.now(), getProtectedRunIds(activeRuns));
@@ -369,9 +388,7 @@ export default function (pi: ExtensionAPI) {
     if (pruneResult.errors.length > 0 && ctx.hasUI) {
       ctx.ui.notify(`Could not prune ${pruneResult.errors.length} subagent run artifact director${pruneResult.errors.length === 1 ? "y" : "ies"}.`, "warning");
     }
-    reconcileStoredRuns();
     uiRefreshTimer = setInterval(() => {
-      reconcileStoredRuns();
       refreshUi();
     }, FLEET_REFRESH_MS);
     uiRefreshTimer.unref?.();
@@ -410,10 +427,31 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("subagent-runs", {
-    description: "List async subagent runs",
+    description: "List persisted subagent runs",
     handler: async (_args, ctx) => {
       const runs = listRunRecords();
       ctx.ui.notify(renderRunList(runs).join("\n"), "info");
+    },
+  });
+
+  pi.registerCommand("subagent-inspect", {
+    description: "Browse active and recent subagent runs",
+    handler: async (_args, ctx) => {
+      if (ctx.mode !== "tui") {
+        ctx.ui.notify("/subagent-inspect requires interactive TUI mode.", "error");
+        return;
+      }
+      try {
+        await openSubagentInspector(
+          ctx,
+          activeRuns,
+          liveRunControls,
+          () => refreshUi(ctx),
+          (close) => { closeActiveInspector = close; },
+        );
+      } finally {
+        closeActiveInspector = undefined;
+      }
     },
   });
 
@@ -498,7 +536,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (input.action === "stop") {
-        const result = stopRun(input.runId, activeRuns);
+        const result = stopRun(input.runId, activeRuns, liveRunControls);
         refreshUi(ctx);
         return {
           content: [{ type: "text", text: renderStopText(result) }],
@@ -528,6 +566,7 @@ export default function (pi: ExtensionAPI) {
           timeoutMs: input.timeoutMs,
           signal,
           onUpdate,
+          liveRunControls,
         }, ctx);
         refreshUi(ctx);
         return {
@@ -573,6 +612,7 @@ export default function (pi: ExtensionAPI) {
           timeoutMs: input.timeoutMs,
           signal,
           onUpdate,
+          liveRunControls,
         }, ctx);
         refreshUi(ctx);
         return {
@@ -606,6 +646,7 @@ export default function (pi: ExtensionAPI) {
         parentSessionFile,
         signal,
         onUpdate,
+        liveRunControls,
       };
 
       if (input.async ?? agent.override.async) {
@@ -651,6 +692,294 @@ export default function (pi: ExtensionAPI) {
       return renderSubagentToolResult(result, options, theme);
     },
   });
+}
+
+type InspectorRun = {
+  runId: string;
+  agent: string;
+  task: string;
+  status: AsyncRunStatus;
+  executionMode: FleetEntryKind;
+  startedAtMs: number;
+  finishedAtMs?: number;
+  model?: string;
+  thinking?: string;
+  contextMode?: ContextMode;
+  cwd: string;
+  groupId?: string;
+  stepLabel?: string;
+  currentTool?: string;
+  currentToolArgs?: string;
+  currentPath?: string;
+  output: string;
+  artifactPath?: string;
+};
+
+async function openSubagentInspector(
+  ctx: any,
+  activeRuns: Map<string, ActiveRun>,
+  liveRunControls: Map<string, LiveRunControl>,
+  onChange: () => void,
+  registerClose: (close: (() => void) | undefined) => void,
+) {
+  await ctx.ui.custom<void>((tui: any, theme: any, _keybindings: any, done: () => void) => {
+    let closed = false;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      done();
+    };
+    registerClose(close);
+    let runs = collectInspectorRuns();
+    let selectedIndex = 0;
+    let detailOpen = false;
+    let detailScroll = 0;
+    let confirmStopRunId: string | undefined;
+    let confirmStopUntil = 0;
+    let notice = "";
+    let fingerprint = inspectorFingerprint(runs);
+
+    const selected = () => runs[selectedIndex];
+    const refresh = () => {
+      let confirmationExpired = false;
+      if (confirmStopRunId && Date.now() > confirmStopUntil) {
+        confirmStopRunId = undefined;
+        confirmStopUntil = 0;
+        notice = "Stop confirmation expired.";
+        confirmationExpired = true;
+      }
+      const selectedRunId = selected()?.runId;
+      const nextRuns = collectInspectorRuns();
+      const nextFingerprint = inspectorFingerprint(nextRuns);
+      runs = nextRuns;
+      if (selectedRunId) {
+        const nextIndex = runs.findIndex((run) => run.runId === selectedRunId);
+        if (nextIndex >= 0) selectedIndex = nextIndex;
+      }
+      selectedIndex = Math.max(0, Math.min(selectedIndex, Math.max(0, runs.length - 1)));
+      if (nextFingerprint !== fingerprint || confirmationExpired) {
+        fingerprint = nextFingerprint;
+        tui.requestRender();
+      }
+    };
+
+    const timer = setInterval(refresh, 750);
+    timer.unref?.();
+
+    return {
+      render(width: number): string[] {
+        if (detailOpen && selected()) return renderInspectorDetail(selected()!, width, theme, detailScroll, notice, confirmStopRunId);
+        return renderInspectorList(runs, selectedIndex, width, theme, notice, confirmStopRunId);
+      },
+      invalidate() {},
+      handleInput(data: string) {
+        if (isKeyRelease(data) || isKeyRepeat(data)) return;
+        if (matchesKey(data, "escape") || matchesKey(data, "q")) {
+          if (detailOpen) {
+            detailOpen = false;
+            detailScroll = 0;
+            confirmStopRunId = undefined;
+            confirmStopUntil = 0;
+            notice = "";
+            tui.requestRender();
+          } else {
+            close();
+          }
+          return;
+        }
+        if (matchesKey(data, "r")) {
+          confirmStopRunId = undefined;
+          confirmStopUntil = 0;
+          notice = "Refreshed.";
+          refresh();
+          tui.requestRender();
+          return;
+        }
+        if (matchesKey(data, "s")) {
+          const run = selected();
+          if (!run || (run.status !== "running" && run.status !== "queued")) {
+            notice = "The selected run is not active.";
+            confirmStopRunId = undefined;
+            confirmStopUntil = 0;
+          } else if (confirmStopRunId !== run.runId || Date.now() > confirmStopUntil) {
+            confirmStopRunId = run.runId;
+            confirmStopUntil = Date.now() + 3000;
+            notice = "Press s again within 3 seconds to stop this run.";
+          } else {
+            const result = stopRun(run.runId, activeRuns, liveRunControls);
+            confirmStopRunId = undefined;
+            confirmStopUntil = 0;
+            notice = result.message;
+            onChange();
+            refresh();
+          }
+          tui.requestRender();
+          return;
+        }
+        confirmStopRunId = undefined;
+        confirmStopUntil = 0;
+        notice = "";
+
+        if (detailOpen) {
+          if (matchesKey(data, "left") || matchesKey(data, "h")) {
+            detailOpen = false;
+            detailScroll = 0;
+          } else if (matchesKey(data, "down") || matchesKey(data, "j")) {
+            detailScroll += 1;
+          } else if (matchesKey(data, "up") || matchesKey(data, "k")) {
+            detailScroll = Math.max(0, detailScroll - 1);
+          } else if (matchesKey(data, "pagedown") || matchesKey(data, "ctrl+f")) {
+            detailScroll += 8;
+          } else if (matchesKey(data, "pageup") || matchesKey(data, "ctrl+b")) {
+            detailScroll = Math.max(0, detailScroll - 8);
+          } else if (matchesKey(data, "g")) {
+            detailScroll = 0;
+          }
+          tui.requestRender();
+          return;
+        }
+
+        if (matchesKey(data, "down") || matchesKey(data, "j")) {
+          selectedIndex = Math.min(Math.max(0, runs.length - 1), selectedIndex + 1);
+        } else if (matchesKey(data, "up") || matchesKey(data, "k")) {
+          selectedIndex = Math.max(0, selectedIndex - 1);
+        } else if (matchesKey(data, Key.enter) || matchesKey(data, "right") || matchesKey(data, "l")) {
+          if (selected()) {
+            detailOpen = true;
+            detailScroll = 0;
+          }
+        }
+        tui.requestRender();
+      },
+      dispose() {
+        clearInterval(timer);
+        registerClose(undefined);
+      },
+    };
+  });
+}
+
+function sanitizeInspectorText(value: string | undefined): string {
+  if (!value) return "";
+  return stripTerminalSequences(value).replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "");
+}
+
+function collectInspectorRuns(limit = 50): InspectorRun[] {
+  const records = listRunRecords(limit);
+  const byId = new Map<string, InspectorRun>();
+  for (const record of records) {
+    byId.set(record.runId, {
+      runId: sanitizeInspectorText(record.runId),
+      agent: sanitizeInspectorText(record.agent),
+      task: sanitizeInspectorText(record.task),
+      status: record.status,
+      executionMode: record.executionMode || "async",
+      startedAtMs: Date.parse(record.startedAt) || Date.now(),
+      finishedAtMs: record.finishedAt ? Date.parse(record.finishedAt) : undefined,
+      model: sanitizeInspectorText(record.model) || undefined,
+      thinking: sanitizeInspectorText(record.thinking) || undefined,
+      contextMode: record.contextMode,
+      cwd: sanitizeInspectorText(record.cwd),
+      groupId: sanitizeInspectorText(record.groupId) || undefined,
+      stepLabel: sanitizeInspectorText(record.stepLabel) || undefined,
+      output: sanitizeInspectorText(readPreview(record.outputPath) || record.completionSummary || ""),
+      artifactPath: sanitizeInspectorText(record.resultFullPath) || undefined,
+    });
+  }
+  for (const entry of fleetEntries.values()) {
+    const existing = byId.get(entry.runId);
+    byId.set(entry.runId, {
+      runId: sanitizeInspectorText(entry.runId),
+      agent: sanitizeInspectorText(entry.agent),
+      task: sanitizeInspectorText(entry.task),
+      status: entry.status,
+      executionMode: entry.kind,
+      startedAtMs: entry.startedAtMs,
+      finishedAtMs: entry.finishedAtMs,
+      model: sanitizeInspectorText(entry.model || existing?.model) || undefined,
+      thinking: existing?.thinking,
+      contextMode: entry.contextMode || existing?.contextMode,
+      cwd: sanitizeInspectorText(entry.cwd),
+      groupId: sanitizeInspectorText(entry.groupId) || undefined,
+      stepLabel: sanitizeInspectorText(entry.stepLabel) || undefined,
+      currentTool: sanitizeInspectorText(entry.currentTool) || undefined,
+      currentToolArgs: sanitizeInspectorText(entry.currentToolArgs) || undefined,
+      currentPath: sanitizeInspectorText(entry.currentPath) || undefined,
+      output: sanitizeInspectorText(entry.outputPreview || existing?.output || ""),
+      artifactPath: sanitizeInspectorText(entry.artifactPath || existing?.artifactPath) || undefined,
+    });
+  }
+  return Array.from(byId.values()).sort((a, b) => {
+    const activeA = a.status === "running" || a.status === "queued" ? 1 : 0;
+    const activeB = b.status === "running" || b.status === "queued" ? 1 : 0;
+    return activeB - activeA || b.startedAtMs - a.startedAtMs;
+  }).slice(0, limit);
+}
+
+function inspectorFingerprint(runs: InspectorRun[]): string {
+  return JSON.stringify(runs.map((run) => [run.runId, run.status, run.currentTool, run.currentPath, run.output, formatInspectorElapsed(run)]));
+}
+
+function renderInspectorList(runs: InspectorRun[], selectedIndex: number, width: number, theme: any, notice: string, confirmStopRunId?: string): string[] {
+  const lines = [
+    truncateToWidth(theme.fg("accent", theme.bold("Subagent inspector")), width),
+    truncateToWidth(theme.fg("dim", "↑↓/jk select · enter details · s stop · r refresh · esc close"), width),
+    "",
+  ];
+  if (runs.length === 0) lines.push(truncateToWidth(theme.fg("muted", "No persisted subagent runs."), width));
+  const maxRows = 8;
+  const start = Math.max(0, Math.min(selectedIndex - Math.floor(maxRows / 2), Math.max(0, runs.length - maxRows)));
+  for (let index = start; index < Math.min(runs.length, start + maxRows); index += 1) {
+    const run = runs[index]!;
+    const selected = index === selectedIndex;
+    const marker = selected ? theme.fg("accent", "●") : theme.fg("dim", "○");
+    const label = `${marker} ${run.agent} · ${run.executionMode} · ${run.status} · ${formatInspectorElapsed(run)}`;
+    lines.push(truncateToWidth(selected ? theme.bold(label) : label, width));
+    lines.push(truncateToWidth(theme.fg("dim", `   ${run.stepLabel ? `${run.stepLabel} · ` : ""}${run.task.replace(/\s+/g, " ")}`), width));
+  }
+  if (runs.length > maxRows) lines.push(truncateToWidth(theme.fg("dim", `${start + 1}-${Math.min(runs.length, start + maxRows)} of ${runs.length}`), width));
+  if (notice) lines.push("", truncateToWidth(confirmStopRunId ? theme.fg("warning", notice) : theme.fg("muted", notice), width));
+  return lines;
+}
+
+function renderInspectorDetail(run: InspectorRun, width: number, theme: any, scroll: number, notice: string, confirmStopRunId?: string): string[] {
+  const activity = run.currentTool
+    ? `${run.currentTool}${run.currentToolArgs ? ` ${run.currentToolArgs}` : ""}${run.currentPath ? ` · ${run.currentPath}` : ""}`
+    : undefined;
+  const content = [
+    `${theme.fg("accent", theme.bold(run.agent))} · ${run.executionMode} · ${run.status} · ${formatInspectorElapsed(run)}`,
+    `runId: ${run.runId}`,
+    run.stepLabel ? `step: ${run.stepLabel}` : undefined,
+    run.groupId ? `group: ${run.groupId}` : undefined,
+    `model: ${run.model || "inherited"}`,
+    `thinking: ${run.thinking || "inherited"}`,
+    `context: ${run.contextMode || "fresh"}`,
+    `cwd: ${run.cwd}`,
+    activity ? `activity: ${activity}` : undefined,
+    run.artifactPath ? `artifact: ${run.artifactPath}` : undefined,
+    "",
+    `task: ${run.task}`,
+    "",
+    "output:",
+    ...(run.output ? run.output.split("\n") : ["(no output yet)"]),
+  ].filter((line): line is string => line !== undefined);
+  const wrappedContent = content.flatMap((line) => line === "" ? [""] : wrapTextWithAnsi(line, Math.max(1, width)));
+  const maxVisible = 20;
+  const maxScroll = Math.max(0, wrappedContent.length - maxVisible);
+  const clampedScroll = Math.min(Math.max(0, scroll), maxScroll);
+  const lines = [
+    truncateToWidth(theme.fg("accent", theme.bold("Subagent details")), width),
+    truncateToWidth(theme.fg("dim", "↑↓/jk scroll · pgup/pgdn page · ←/esc back · s stop · r refresh"), width),
+    "",
+    ...wrappedContent.slice(clampedScroll, clampedScroll + maxVisible),
+  ];
+  if (notice) lines.push("", truncateToWidth(confirmStopRunId ? theme.fg("warning", notice) : theme.fg("muted", notice), width));
+  return lines;
+}
+
+function formatInspectorElapsed(run: InspectorRun): string {
+  const end = run.finishedAtMs || Date.now();
+  return `${Math.max(0, Math.round((end - run.startedAtMs) / 1000))}s`;
 }
 
 function toolError(text: string) {
@@ -762,7 +1091,7 @@ function resolveRequestedTasks(
 
 async function runParallelForeground(
   steps: Array<{ agent: AgentDef; task: string; model?: string; thinking?: string; cwd?: string; timeoutMs?: number }>,
-  options: { cwd: string; depth: number; context?: ContextMode; parentSessionId?: string; parentSessionFile?: string; timeoutMs?: number; signal?: AbortSignal; onUpdate?: (result: any) => void },
+  options: { cwd: string; depth: number; context?: ContextMode; parentSessionId?: string; parentSessionFile?: string; timeoutMs?: number; signal?: AbortSignal; onUpdate?: (result: any) => void; liveRunControls?: Map<string, LiveRunControl> },
   ctx: any,
 ) {
   const groupId = createRunId("parallel-fg");
@@ -794,6 +1123,7 @@ async function runParallelForeground(
     signal: controller.signal,
     onUpdate: () => emitGroupUpdate(),
     onSpawnError: () => controller.abort(),
+    liveRunControls: options.liveRunControls,
   }, ctx).catch((error) => {
     controller.abort();
     throw error;
@@ -829,7 +1159,7 @@ async function runParallelForeground(
 
 async function runChainForeground(
   steps: Array<{ agent: AgentDef; task: string; model?: string; thinking?: string; cwd?: string; timeoutMs?: number }>,
-  options: { cwd: string; depth: number; context?: ContextMode; parentSessionId?: string; parentSessionFile?: string; timeoutMs?: number; signal?: AbortSignal; onUpdate?: (result: any) => void },
+  options: { cwd: string; depth: number; context?: ContextMode; parentSessionId?: string; parentSessionFile?: string; timeoutMs?: number; signal?: AbortSignal; onUpdate?: (result: any) => void; liveRunControls?: Map<string, LiveRunControl> },
   ctx: any,
 ) {
   const groupId = createRunId("chain-fg");
@@ -864,6 +1194,7 @@ async function runChainForeground(
       stepLabel: `chain ${index + 1}/${steps.length}`,
       signal: options.signal,
       onUpdate: () => emitGroupUpdate(),
+      liveRunControls: options.liveRunControls,
     }, ctx);
     results.push({ index, agent: step.agent.runtimeName, task: step.task, ...result });
     previousOutput = result.output;
@@ -1106,6 +1437,7 @@ function launchAsyncRun(
   const record: RunRecord = {
     runId,
     kind: "single",
+    executionMode: "async",
     agent: agent.runtimeName,
     task: options.task,
     cwd: options.cwd,
@@ -1132,7 +1464,6 @@ function launchAsyncRun(
     totalSteps: options.totalSteps,
     stepLabel: options.stepLabel,
   };
-  persistRunRecord(record);
   upsertFleetEntry(fleetEntryFromRecord(record, "async"));
   appendRunEntry(pi, record, "started");
 
@@ -1146,6 +1477,7 @@ function launchAsyncRun(
   });
 
   record.pid = proc.pid;
+  record.processStartedAtMs = Date.now();
   persistRunRecord(record);
 
   const active: ActiveRun = {
@@ -1165,6 +1497,10 @@ function launchAsyncRun(
       updateFleetStatus(runId, "timed_out");
       persistRunRecord(active.record);
       proc.kill("SIGTERM");
+      const killTimer = setTimeout(() => {
+        if (activeRuns.get(runId) === active && proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
+      }, FOREGROUND_KILL_GRACE_MS);
+      killTimer.unref?.();
     }, plan.timeoutMs);
     active.timer.unref?.();
   }
@@ -1192,6 +1528,8 @@ function launchAsyncRun(
     if (active.record.stopped) active.record.status = "stopped";
     if (active.record.timedOut) active.record.status = "timed_out";
     active.record.exitCode = code ?? 1;
+    active.record.pid = undefined;
+    active.record.processStartedAtMs = undefined;
     active.record.finishedAt = new Date().toISOString();
     active.record.elapsedMs = Date.now() - active.startedAtMs;
     finalizeRunArtifacts(active.record, active.outputChunks.join(""), active.stderrChunks.join(""));
@@ -1209,6 +1547,8 @@ function launchAsyncRun(
     updateFleetPreview(runId, error.message);
     active.record.status = "spawn_error";
     active.record.exitCode = 1;
+    active.record.pid = undefined;
+    active.record.processStartedAtMs = undefined;
     active.record.finishedAt = new Date().toISOString();
     active.record.elapsedMs = Date.now() - active.startedAtMs;
     finalizeRunArtifacts(active.record, active.outputChunks.join(""), active.stderrChunks.join(""));
@@ -1232,11 +1572,68 @@ async function runChildAgentForeground(
   const runDir = join(RUNS_DIR, runId);
   createRunArtifactDirectory(runDir, runId, "foreground");
   const candidates = getModelCandidates(agent, options, ctx);
+  const startedAtMs = Date.now();
+  const record: RunRecord = {
+    runId,
+    kind: "single",
+    executionMode: "foreground",
+    agent: agent.runtimeName,
+    task: options.task,
+    cwd: options.cwd,
+    contextMode: options.context,
+    model: candidates[0],
+    thinking: resolveThinking(agent, options, ctx),
+    modelCandidates: candidates,
+    timeoutMs: options.timeoutMs || agent.override.timeoutMs,
+    command: [],
+    sourcePath: agent.sourcePath,
+    status: "running",
+    startedAt: new Date(startedAtMs).toISOString(),
+    outputPath: join(runDir, "output.txt"),
+    stderrPath: join(runDir, "stderr.txt"),
+    metaPath: join(runDir, "meta.json"),
+    resultSummaryPath: join(runDir, "result.summary.md"),
+    resultFullPath: join(runDir, "result.full.md"),
+    parentSessionId: options.parentSessionId,
+    parentSessionFile: options.parentSessionFile,
+    notification: { state: "delivered", deliveredAt: new Date().toISOString() },
+    groupId: options.groupId,
+    stepIndex: options.stepIndex,
+    totalSteps: options.totalSteps,
+    stepLabel: options.stepLabel,
+  };
   let lastResult: Omit<ForegroundRunResult, "attemptedModels"> | undefined;
+  let persistedOutput = "";
+  let persistedStderr = "";
   const attempted: string[] = [];
 
   for (const candidate of candidates.length > 0 ? candidates : [undefined]) {
-    const plan = buildChildPlan(agent, { ...options, model: candidate }, ctx, runDir);
+    let plan: ChildPlan;
+    try {
+      plan = buildChildPlan(agent, { ...options, model: candidate }, ctx, runDir);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      lastResult = {
+        output: message,
+        exitCode: 1,
+        elapsedMs: Date.now() - startedAtMs,
+        timedOut: false,
+        stopped: false,
+        model: candidate,
+        thinking: resolveThinking(agent, options, ctx),
+        timeoutMs: options.timeoutMs || agent.override.timeoutMs,
+        command: [],
+        contextMode: options.context,
+        childSessionFile: undefined,
+      };
+      break;
+    }
+    record.model = plan.model;
+    record.thinking = plan.thinking;
+    record.timeoutMs = plan.timeoutMs;
+    record.command = plan.args;
+    record.contextMode = plan.contextMode;
+    record.childSessionFile = plan.childSessionFile;
     upsertFleetEntry({
       key: runId,
       runId,
@@ -1278,6 +1675,9 @@ async function runChildAgentForeground(
       }
 
       const proc = spawn("pi", plan.args, { cwd: options.cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+      record.pid = proc.pid;
+      record.processStartedAtMs = Date.now();
+      persistRunRecord(record);
       const activeMarkerPath = join(runDir, "active.json");
       writeFileSync(activeMarkerPath, `${JSON.stringify({ kind: "foreground", pid: proc.pid, startedAt: new Date().toISOString() }, null, 2)}\n`, "utf8");
       let timedOut = false;
@@ -1288,11 +1688,20 @@ async function runChildAgentForeground(
       let killTimer: ReturnType<typeof setTimeout> | undefined;
       const textChunks: string[] = [];
       const stderrChunks: string[] = [];
+      const persistCurrentBuffers = () => {
+        writeFileSync(record.outputPath, `${persistedOutput}${textChunks.join("")}`, "utf8");
+        writeFileSync(record.stderrPath, `${persistedStderr}${stderrChunks.join("")}`, "utf8");
+      };
 
       const requestTermination = (reason: "stopped" | "timed_out") => {
         if (settled || stopped || timedOut) return;
         stopped = reason === "stopped";
         timedOut = reason === "timed_out";
+        record.stopped = stopped;
+        record.timedOut = timedOut;
+        record.stopRequestedAt = stopped ? new Date().toISOString() : record.stopRequestedAt;
+        record.status = reason;
+        persistRunRecord(record);
         updateFleetStatus(runId, reason);
         emitForegroundUpdate(true);
         proc.kill("SIGTERM");
@@ -1302,6 +1711,8 @@ async function runChildAgentForeground(
         killTimer.unref?.();
       };
       const requestStop = () => requestTermination("stopped");
+      const liveControl: LiveRunControl = { record, requestStop };
+      options.liveRunControls?.set(runId, liveControl);
       options.signal?.addEventListener("abort", requestStop, { once: true });
       if (options.signal?.aborted) requestStop();
       if (plan.timeoutMs) {
@@ -1313,6 +1724,7 @@ async function runChildAgentForeground(
         if (timer) clearTimeout(timer);
         if (killTimer) clearTimeout(killTimer);
         options.signal?.removeEventListener("abort", requestStop);
+        if (options.liveRunControls?.get(runId) === liveControl) options.liveRunControls.delete(runId);
         rmSync(activeMarkerPath, { force: true });
       };
 
@@ -1332,27 +1744,37 @@ async function runChildAgentForeground(
           updateFleetActivity(runId, activity);
           emitForegroundUpdate();
         });
+        persistCurrentBuffers();
       });
 
       proc.stderr.setEncoding("utf8");
       proc.stderr.on("data", (chunk: string) => {
         stderrChunks.push(chunk);
         updateFleetPreview(runId, chunk);
+        persistCurrentBuffers();
         emitForegroundUpdate();
       });
 
       proc.on("close", (code) => {
+        if (settled) return;
         if (buffer.trim()) consumeJsonLine(buffer, textChunks, (activity) => {
           updateFleetActivity(runId, activity);
           emitForegroundUpdate(true);
         });
+        const candidateOutput = textChunks.join("");
+        const candidateStderr = stderrChunks.join("");
+        persistedOutput += candidateOutput;
+        persistedStderr += candidateStderr;
+        writeFileSync(record.outputPath, persistedOutput, "utf8");
+        writeFileSync(record.stderrPath, persistedStderr, "utf8");
         const output = stopped
           ? "Subagent cancelled."
           : timedOut
-            ? textChunks.join("").trim() || stderrChunks.join("").trim() || "Subagent timed out."
-            : textChunks.join("").trim() || stderrChunks.join("").trim();
+            ? candidateOutput.trim() || candidateStderr.trim() || "Subagent timed out."
+            : candidateOutput.trim() || candidateStderr.trim();
         settle({
           output,
+          stderr: candidateStderr,
           exitCode: stopped || timedOut ? 1 : code ?? 1,
           elapsedMs: Date.now() - startedAt,
           timedOut,
@@ -1367,10 +1789,19 @@ async function runChildAgentForeground(
       });
 
       proc.on("error", (error) => {
+        if (settled) return;
+        stderrChunks.push(error.message);
         updateFleetPreview(runId, error.message);
+        const candidateOutput = textChunks.join("");
+        const candidateStderr = stderrChunks.join("");
+        persistedOutput += candidateOutput;
+        persistedStderr += candidateStderr;
+        writeFileSync(record.outputPath, persistedOutput, "utf8");
+        writeFileSync(record.stderrPath, persistedStderr, "utf8");
         emitForegroundUpdate(true);
         settle({
           output: error.message,
+          stderr: candidateStderr,
           exitCode: 1,
           elapsedMs: Date.now() - startedAt,
           timedOut,
@@ -1386,6 +1817,12 @@ async function runChildAgentForeground(
       });
     });
 
+    const persistedState = readRunRecord(runId);
+    if (persistedState?.stopped && !result.timedOut) {
+      result.stopped = true;
+      result.exitCode = 1;
+      result.output = "Subagent cancelled.";
+    }
     if (result.model) attempted.push(result.model);
     lastResult = result;
     if (result.stopped || result.timedOut || result.exitCode === 0 || candidate === candidates[candidates.length - 1]) break;
@@ -1410,6 +1847,26 @@ async function runChildAgentForeground(
     contextMode: options.context,
     childSessionFile: undefined,
   };
+  record.status = finalStatus;
+  record.exitCode = fallback.exitCode;
+  record.pid = undefined;
+  record.processStartedAtMs = undefined;
+  record.finishedAt = new Date().toISOString();
+  record.elapsedMs = Date.now() - startedAtMs;
+  record.timedOut = fallback.timedOut;
+  record.stopped = fallback.stopped;
+  record.model = fallback.model;
+  record.thinking = fallback.thinking;
+  record.timeoutMs = fallback.timeoutMs;
+  record.command = fallback.command;
+  record.contextMode = fallback.contextMode;
+  record.childSessionFile = fallback.childSessionFile;
+  const finalOutput = persistedOutput.trim() ? persistedOutput : fallback.stderr ? "" : fallback.output;
+  const finalStderr = persistedStderr || fallback.stderr || "";
+  writeFileSync(record.outputPath, finalOutput, "utf8");
+  writeFileSync(record.stderrPath, finalStderr, "utf8");
+  finalizeRunArtifacts(record, finalOutput, finalStderr);
+  persistRunRecord(record);
   return { ...fallback, attemptedModels: attempted };
 }
 
@@ -1557,6 +2014,8 @@ function extractEntryText(entry: any): string {
     .join("\n");
 }
 
+const streamedTextState = new WeakMap<string[], { index: number; text: string }>();
+
 function consumeJsonLine(line: string, textChunks: string[], onActivity?: (activity: ChildActivity) => void) {
   if (!line.trim()) return;
   try {
@@ -1564,7 +2023,16 @@ function consumeJsonLine(line: string, textChunks: string[], onActivity?: (activ
     const activity = extractChildActivity(event);
     if (event.type === "message_update") {
       const delta = event.assistantMessageEvent;
-      if (delta?.type === "text_delta" && typeof delta.delta === "string") textChunks.push(delta.delta);
+      if (delta?.type === "text_delta" && typeof delta.delta === "string") {
+        let state = streamedTextState.get(textChunks);
+        if (!state) {
+          state = { index: textChunks.length, text: "" };
+          streamedTextState.set(textChunks, state);
+          textChunks.push("");
+        }
+        state.text += delta.delta;
+        textChunks[state.index] = state.text;
+      }
     }
     if (event.type === "message_end" && event.message?.role === "assistant") {
       const parts = event.message?.content;
@@ -1573,7 +2041,12 @@ function consumeJsonLine(line: string, textChunks: string[], onActivity?: (activ
           .filter((part: any) => part?.type === "text" && typeof part.text === "string")
           .map((part: any) => part.text)
           .join("");
-        if (text) textChunks.push(text);
+        const state = streamedTextState.get(textChunks);
+        if (text) {
+          if (state) textChunks[state.index] = text;
+          else textChunks.push(text);
+        }
+        streamedTextState.delete(textChunks);
       }
     }
     if (onActivity && Object.keys(activity).length > 0) onActivity(activity);
@@ -1678,32 +2151,79 @@ function getRunStatus(runId: string | undefined): { isError?: boolean; runId?: s
   };
 }
 
-function stopRun(runId: string | undefined, activeRuns: Map<string, ActiveRun>): { isError?: boolean; runId?: string; status?: string; message: string } {
+function stopRun(
+  runId: string | undefined,
+  activeRuns: Map<string, ActiveRun>,
+  liveRunControls: Map<string, LiveRunControl>,
+): { isError?: boolean; runId?: string; status?: string; message: string } {
   if (!runId) return { isError: true, message: "Missing runId for stop." };
+  if (!resolveRunDirectory(runId)) return { isError: true, runId, message: `Invalid runId '${runId}'.` };
+
+  const live = liveRunControls.get(runId);
+  if (live) {
+    live.requestStop();
+    return { runId, status: "stopping", message: `Stop requested for run '${runId}'.` };
+  }
+
   const active = activeRuns.get(runId);
   if (active) {
     active.record.stopped = true;
     active.record.stopRequestedAt = new Date().toISOString();
     persistRunRecord(active.record);
     active.proc.kill("SIGTERM");
+    const killTimer = setTimeout(() => {
+      if (activeRuns.get(runId) === active && active.proc.exitCode === null && active.proc.signalCode === null) active.proc.kill("SIGKILL");
+    }, FOREGROUND_KILL_GRACE_MS);
+    killTimer.unref?.();
     return { runId, status: "stopping", message: `Stop requested for run '${runId}'.` };
   }
 
   const existing = readRunRecord(runId);
   if (!existing) return { isError: true, runId, message: `Run '${runId}' not found.` };
+  if (isTerminalRunStatus(existing.status)) {
+    return { isError: true, runId, status: existing.status, message: `Run '${runId}' already finished with status ${existing.status}.` };
+  }
+  if (!existing.pid || !isOwnedPersistedProcess(existing)) {
+    return { isError: true, runId, status: existing.status, message: `Run '${runId}' is not owned by this extension process and could not be stopped safely.` };
+  }
+
   existing.stopRequestedAt = new Date().toISOString();
   existing.stopped = true;
   persistRunRecord(existing);
-  if (existing.pid && isPidAlive(existing.pid)) {
-    try {
-      process.kill(existing.pid, "SIGTERM");
-      return { runId, status: "stopping", message: `Stop requested for run '${runId}'.` };
-    } catch {
-      return { runId, status: existing.status, message: `Stop requested for run '${runId}', but the owning process could not be signalled.` };
-    }
+  try {
+    process.kill(existing.pid, "SIGTERM");
+    const pid = existing.pid;
+    const killTimer = setTimeout(() => {
+      if (isOwnedPersistedProcess(existing)) {
+        try { process.kill(pid, "SIGKILL"); } catch {}
+      }
+    }, FOREGROUND_KILL_GRACE_MS);
+    killTimer.unref?.();
+    return { runId, status: "stopping", message: `Stop requested for run '${runId}'.` };
+  } catch {
+    return { isError: true, runId, status: existing.status, message: `Stop requested for run '${runId}', but the owning process could not be signalled.` };
   }
-  const reconciled = reconcileRunRecord(existing);
-  return { runId, status: reconciled.status, message: `Run '${runId}' is not live anymore; marked as ${reconciled.status}.` };
+}
+
+function isTerminalRunStatus(status: AsyncRunStatus): boolean {
+  return status !== "running" && status !== "queued";
+}
+
+function isOwnedPersistedProcess(record: RunRecord): boolean {
+  if (!record.pid || !record.processStartedAtMs || !isPidAlive(record.pid)) return false;
+  const runDir = resolveRunDirectory(record.runId);
+  if (!runDir) return false;
+  const taskPath = join(runDir, "task.md");
+  if (!Array.isArray(record.command) || !record.command.some((arg) => arg === `@${taskPath}`)) return false;
+  try {
+    const command = execFileSync("ps", ["-p", String(record.pid), "-o", "command="], { encoding: "utf8", timeout: 1000 }).trim();
+    const started = execFileSync("ps", ["-p", String(record.pid), "-o", "lstart="], { encoding: "utf8", timeout: 1000 }).trim();
+    const processStartedAtMs = Date.parse(started);
+    if (!Number.isFinite(processStartedAtMs) || Math.abs(processStartedAtMs - record.processStartedAtMs) > 5000) return false;
+    return command.includes(taskPath) && command.includes("--mode") && command.includes("json");
+  } catch {
+    return false;
+  }
 }
 
 function renderRunStatusText(result: { isError?: boolean; runId?: string; run?: RunRecord; runs?: RunRecord[]; outputPreview?: string; stderrPreview?: string }): string {
@@ -1929,20 +2449,26 @@ function persistRunRecord(record: RunRecord) {
   refreshExternalUi();
 }
 
-function listRunRecords(): RunRecord[] {
+function listRunRecords(limit?: number): RunRecord[] {
   const runs: RunRecord[] = [];
-  let entries: string[];
+  let entries: Dirent[];
   try {
     ensureRunsDir();
-    entries = readdirSync(RUNS_DIR);
+    entries = readdirSync(RUNS_DIR, { withFileTypes: true });
   } catch {
     return runs;
   }
-  for (const entry of entries) {
-    const metaPath = join(RUNS_DIR, entry, "meta.json");
-    if (!existsSync(metaPath)) continue;
+  const candidates = entries
+    .filter((entry) => entry.isDirectory() && isExpectedRunDirectoryName(entry.name))
+    .map((entry) => ({
+      metaPath: join(RUNS_DIR, entry.name, "meta.json"),
+      timestamp: runIdTimestamp(entry.name),
+    }))
+    .sort((a, b) => b.timestamp - a.timestamp);
+  const selected = typeof limit === "number" ? candidates.slice(0, Math.max(0, limit)) : candidates;
+  for (const candidate of selected) {
     try {
-      const parsed = JSON.parse(readFileSync(metaPath, "utf8")) as RunRecord;
+      const parsed = JSON.parse(readFileSync(candidate.metaPath, "utf8")) as RunRecord;
       runs.push(reconcileRunRecord(parsed));
     } catch {
       // ignore bad file
@@ -1952,6 +2478,15 @@ function listRunRecords(): RunRecord[] {
   return runs;
 }
 
+function runIdTimestamp(runId: string): number {
+  const match = runId.match(/-(\d{14})-[a-z0-9]{6}$/i);
+  if (!match) return 0;
+  const stamp = match[1]!;
+  const iso = `${stamp.slice(0, 4)}-${stamp.slice(4, 6)}-${stamp.slice(6, 8)}T${stamp.slice(8, 10)}:${stamp.slice(10, 12)}:${stamp.slice(12, 14)}Z`;
+  const parsed = Date.parse(iso);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 function getVisibleUiRecords(records: RunRecord[], now = Date.now()): RunRecord[] {
   return records.filter((record) => shouldShowInUi(record, records, now));
 }
@@ -1959,7 +2494,7 @@ function getVisibleUiRecords(records: RunRecord[], now = Date.now()): RunRecord[
 function getVisibleFleetEntries(records: RunRecord[], now = Date.now()): FleetEntry[] {
   const entries = new Map<string, FleetEntry>();
   for (const record of getVisibleUiRecords(records, now)) {
-    entries.set(record.runId, fleetEntryFromRecord(record, "async"));
+    entries.set(record.runId, fleetEntryFromRecord(record, record.executionMode || "async"));
   }
   for (const entry of fleetEntries.values()) {
     if (shouldShowFleetEntry(entry, now)) entries.set(entry.key, entry);
@@ -2175,14 +2710,13 @@ function shouldShowInUi(record: RunRecord, records: RunRecord[], now = Date.now(
   return now - completedAt <= COMPLETED_UI_GRACE_MS;
 }
 
-function reconcileStoredRuns() {
-  for (const run of listRunRecords()) {
-    reconcileRunRecord(run);
-  }
-}
-
 function reconcileRunRecord(record: RunRecord): RunRecord {
   let changed = false;
+  if (isTerminalRunStatus(record.status) && (record.pid !== undefined || record.processStartedAtMs !== undefined)) {
+    record.pid = undefined;
+    record.processStartedAtMs = undefined;
+    changed = true;
+  }
   if ((record.status === "running" || record.status === "queued") && (!record.pid || !isPidAlive(record.pid))) {
     record.status = record.stopped || record.stopRequestedAt ? "stopped" : "orphaned";
     record.finishedAt ||= new Date().toISOString();
@@ -2248,8 +2782,17 @@ function appendRunEntry(pi: ExtensionAPI, record: RunRecord, phase: "started" | 
   }
 }
 
+function resolveRunDirectory(runId: string): string | undefined {
+  if (!isExpectedRunDirectoryName(runId)) return undefined;
+  const root = resolve(RUNS_DIR);
+  const runDir = resolve(root, runId);
+  return dirname(runDir) === root ? runDir : undefined;
+}
+
 function readRunRecord(runId: string): RunRecord | undefined {
-  const metaPath = join(RUNS_DIR, runId, "meta.json");
+  const runDir = resolveRunDirectory(runId);
+  if (!runDir) return undefined;
+  const metaPath = join(runDir, "meta.json");
   if (!existsSync(metaPath)) return undefined;
   try {
     return reconcileRunRecord(JSON.parse(readFileSync(metaPath, "utf8")) as RunRecord);
@@ -2260,9 +2803,24 @@ function readRunRecord(runId: string): RunRecord | undefined {
 
 function readPreview(path: string): string {
   if (!existsSync(path)) return "";
-  const raw = readFileSync(path, "utf8").trim();
-  if (!raw) return "";
-  return raw.length > 2000 ? `${raw.slice(0, 2000)}\n…` : raw;
+  let fd: number | undefined;
+  try {
+    const stats = statSync(path);
+    if (stats.size <= 0) return "";
+    const byteLength = Math.min(stats.size, MAX_OUTPUT_PREVIEW_CHARS);
+    const buffer = Buffer.alloc(byteLength);
+    fd = openSync(path, "r");
+    readSync(fd, buffer, 0, byteLength, Math.max(0, stats.size - byteLength));
+    const raw = buffer.toString("utf8").trim();
+    if (!raw) return "";
+    return stats.size > byteLength ? `…\n${raw}` : raw;
+  } catch {
+    return "";
+  } finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch {}
+    }
+  }
 }
 
 function formatFleetActivity(entry: FleetEntry, maxWidth: number): string {
