@@ -86,6 +86,14 @@ Local/private runtime file:
 
 ## Install / load
 
+### Install from npm
+
+```bash
+pi install npm:pi-subagents-compatible
+```
+
+Pin a specific release with `pi install npm:pi-subagents-compatible@0.2.0`.
+
 ### Install from GitHub
 
 ```bash

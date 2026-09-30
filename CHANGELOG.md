@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Publish the package on npm as `pi-subagents-compatible`
+- Add trusted npm publishing through GitHub Actions releases
+- Document npm installation
+
 ## 0.2.0
 
 - Add layered project runtime policy from `./.pi/subagent-overrides.jsonc`, resolved from each child task's effective working directory
