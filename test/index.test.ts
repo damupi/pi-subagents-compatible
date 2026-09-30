@@ -317,3 +317,26 @@ test("retention deletes only expired owned run directories", async () => {
     await retention.cleanup();
   }
 });
+
+test("mutable data stays outside the package and existing legacy data is reused", async () => {
+  for (const dataPathMode of ["default", "legacy", "data-env"] as const) {
+    const isolated = await createHarness({ dataPathMode });
+    try {
+      const tool = isolated.tools.get("subagent");
+      assert.ok(tool);
+      const listed = await tool.execute("list-data-paths", { action: "list" }, undefined, undefined, isolated.ctx);
+      assert.equal(listed.details.configPath, isolated.globalConfigPath);
+
+      await tool.execute("persist-data-path", {
+        agent: "test-agent",
+        task: `DATA PATH ${dataPathMode}`,
+        cwd: isolated.projectDir,
+      }, undefined, undefined, isolated.ctx);
+      const record = isolated.records().find((item) => item.task === `DATA PATH ${dataPathMode}`);
+      assert.ok(record);
+      assert.ok(record.outputPath.startsWith(isolated.runsDir));
+    } finally {
+      await isolated.cleanup();
+    }
+  }
+});

@@ -94,6 +94,17 @@ pi install npm:pi-subagents-compatible
 
 Pin a specific release with `pi install npm:pi-subagents-compatible@0.2.1`.
 
+Mutable configuration and run artifacts are stored outside the installed npm package so package updates do not replace them.
+
+#### Migrate an auto-discovered installation
+
+1. Keep the existing `overrides.jsonc` and `runs/` directory in `~/.pi/agent/extensions/pi-subagent/`.
+2. Rename or remove only the old `index.ts` so Pi cannot load both copies.
+3. Install the npm package with `pi install npm:pi-subagents-compatible`.
+4. Run `/reload`.
+
+When the legacy directory contains `overrides.jsonc` or `runs/`, the npm package reuses it automatically.
+
 ### Install from GitHub
 
 ```bash
@@ -141,19 +152,21 @@ If the same agent exists in both user and project scope, the **project-scope age
 
 For example, if you have `researcher` in both places, `./.pi/agents/researcher.md` is used.
 
-Other configurable paths can be overridden with environment variables:
+Mutable data defaults to `~/.pi/agent/pi-subagent/`. Existing data under `~/.pi/agent/extensions/pi-subagent/` is detected and reused automatically for migration from an auto-discovered installation.
+
+Configurable paths can be overridden with environment variables:
 
 - `PI_SUBAGENT_AGENT_DIR` — optional highest-precedence extra agent directory
-- `PI_SUBAGENT_CONFIG_PATH`
-- `PI_SUBAGENT_RUNS_DIR`
+- `PI_SUBAGENT_DATA_DIR` — parent directory for `overrides.jsonc` and `runs/`
+- `PI_SUBAGENT_CONFIG_PATH` — optional config-file override
+- `PI_SUBAGENT_RUNS_DIR` — optional run-directory override
 - `PI_SUBAGENT_RUN_RETENTION_DAYS` — completed and inactive run artifacts are pruned after this many days; defaults to `7`, and `0` disables pruning
 
 ### Example
 
 ```bash
 export PI_SUBAGENT_AGENT_DIR="$HOME/.config/pi-subagent/shared-agents"
-export PI_SUBAGENT_CONFIG_PATH="$HOME/.pi/agent/extensions/pi-subagent/overrides.jsonc"
-export PI_SUBAGENT_RUNS_DIR="$HOME/.pi/agent/extensions/pi-subagent/runs"
+export PI_SUBAGENT_DATA_DIR="$HOME/.pi/agent/pi-subagent"
 export PI_SUBAGENT_RUN_RETENTION_DAYS="7"
 ```
 

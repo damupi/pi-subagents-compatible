@@ -206,11 +206,17 @@ type ForegroundRunResult = {
 };
 
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
+const LEGACY_DATA_DIR = join(homedir(), ".pi", "agent", "extensions", "pi-subagent");
+const DEFAULT_DATA_DIR = join(homedir(), ".pi", "agent", "pi-subagent");
+const AUTO_DATA_DIR = existsSync(join(LEGACY_DATA_DIR, "overrides.jsonc")) || existsSync(join(LEGACY_DATA_DIR, "runs"))
+  ? LEGACY_DATA_DIR
+  : DEFAULT_DATA_DIR;
+const DATA_DIR = resolveConfiguredPath(process.env.PI_SUBAGENT_DATA_DIR, AUTO_DATA_DIR);
 const ENV_AGENT_DIR = process.env.PI_SUBAGENT_AGENT_DIR?.trim() ? resolve(process.env.PI_SUBAGENT_AGENT_DIR.trim()) : undefined;
-const CONFIG_PATH = resolveConfiguredPath(process.env.PI_SUBAGENT_CONFIG_PATH, join(EXTENSION_DIR, "overrides.jsonc"));
+const CONFIG_PATH = resolveConfiguredPath(process.env.PI_SUBAGENT_CONFIG_PATH, join(DATA_DIR, "overrides.jsonc"));
 const PROJECT_CONFIG_RELATIVE_PATH = join(".pi", "subagent-overrides.jsonc");
 const SCHEMA_PATH = join(EXTENSION_DIR, "overrides.schema.json");
-const RUNS_DIR = resolveConfiguredPath(process.env.PI_SUBAGENT_RUNS_DIR, join(EXTENSION_DIR, "runs"));
+const RUNS_DIR = resolveConfiguredPath(process.env.PI_SUBAGENT_RUNS_DIR, join(DATA_DIR, "runs"));
 const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
 const DEFAULT_RUN_RETENTION_DAYS = 7;
 const RUN_RETENTION_DAYS = parseRunRetentionDays(process.env.PI_SUBAGENT_RUN_RETENTION_DAYS);
