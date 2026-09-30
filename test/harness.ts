@@ -9,16 +9,24 @@ export type RegisteredTool = {
   renderResult?: (...args: any[]) => any;
 };
 
-export async function createHarness(options: { retentionDays?: number } = {}) {
+export async function createHarness(options: { retentionDays?: number; dataPathMode?: "explicit" | "data-env" | "default" | "legacy" } = {}) {
   const repoRoot = process.cwd();
   const originalCwd = process.cwd();
   const root = mkdtempSync(join(tmpdir(), "pi-subagents-compatible-test-"));
   const agentsDir = join(root, "agents");
-  const runsDir = join(root, "runs");
+  const homeDir = join(root, "home");
+  const dataPathMode = options.dataPathMode || "explicit";
+  const dataDir = dataPathMode === "legacy"
+    ? join(homeDir, ".pi", "agent", "extensions", "pi-subagent")
+    : dataPathMode === "default"
+      ? join(homeDir, ".pi", "agent", "pi-subagent")
+      : dataPathMode === "data-env"
+        ? join(root, "data-env")
+        : root;
+  const runsDir = join(dataDir, "runs");
   const projectDir = join(root, "project");
   const binDir = join(root, "bin");
   const markersDir = join(root, "markers");
-  const homeDir = join(root, "home");
   mkdirSync(agentsDir, { recursive: true });
   mkdirSync(join(homeDir, ".pi", "agent", "agents"), { recursive: true });
   mkdirSync(runsDir, { recursive: true });
@@ -27,7 +35,7 @@ export async function createHarness(options: { retentionDays?: number } = {}) {
   mkdirSync(markersDir, { recursive: true });
 
   writeFileSync(join(agentsDir, "test-agent.md"), `---\nname: test-agent\ndescription: Hermetic test agent\n---\n\nYou are a test agent.\n`);
-  const globalConfigPath = join(root, "overrides.jsonc");
+  const globalConfigPath = join(dataDir, "overrides.jsonc");
   writeFileSync(globalConfigPath, JSON.stringify({
     defaults: { timeoutMs: 5000, tools: ["Read"], inheritSkills: false },
     agentOverrides: { "test-agent": { thinking: "low" } },
@@ -85,8 +93,15 @@ if (task.includes("SLEEP_IGNORE_TERM")) {
 
   const originalEnv = { ...process.env };
   process.env.PI_SUBAGENT_AGENT_DIR = agentsDir;
-  process.env.PI_SUBAGENT_CONFIG_PATH = globalConfigPath;
-  process.env.PI_SUBAGENT_RUNS_DIR = runsDir;
+  if (dataPathMode === "explicit") {
+    process.env.PI_SUBAGENT_CONFIG_PATH = globalConfigPath;
+    process.env.PI_SUBAGENT_RUNS_DIR = runsDir;
+  } else {
+    delete process.env.PI_SUBAGENT_CONFIG_PATH;
+    delete process.env.PI_SUBAGENT_RUNS_DIR;
+  }
+  if (dataPathMode === "data-env") process.env.PI_SUBAGENT_DATA_DIR = dataDir;
+  else delete process.env.PI_SUBAGENT_DATA_DIR;
   process.env.PI_SUBAGENT_RUN_RETENTION_DAYS = String(options.retentionDays ?? 0);
   process.env.PI_SUBAGENT_TEST_MARKERS = markersDir;
   process.env.PATH = `${binDir}:${originalEnv.PATH || ""}`;
@@ -209,6 +224,8 @@ if (task.includes("SLEEP_IGNORE_TERM")) {
 
   return {
     root,
+    dataDir,
+    globalConfigPath,
     runsDir,
     projectDir,
     markersDir,
