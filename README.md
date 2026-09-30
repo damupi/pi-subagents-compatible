@@ -92,7 +92,7 @@ Local/private runtime file:
 pi install npm:pi-subagents-compatible
 ```
 
-Pin a specific release with `pi install npm:pi-subagents-compatible@0.2.1`.
+Pin a specific release with `pi install npm:pi-subagents-compatible@0.2.2`.
 
 Mutable configuration and run artifacts are stored outside the installed npm package so package updates do not replace them.
 

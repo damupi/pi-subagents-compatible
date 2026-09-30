@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.2
+
 - Keep mutable configuration and run artifacts outside npm package installations
 - Automatically reuse legacy `~/.pi/agent/extensions/pi-subagent/` data during npm migration
 - Add `PI_SUBAGENT_DATA_DIR` for overriding the shared mutable-data directory
