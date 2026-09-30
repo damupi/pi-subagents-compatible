@@ -92,7 +92,7 @@ Local/private runtime file:
 pi install npm:pi-subagents-compatible
 ```
 
-Pin a specific release with `pi install npm:pi-subagents-compatible@0.2.0`.
+Pin a specific release with `pi install npm:pi-subagents-compatible@0.2.1`.
 
 ### Install from GitHub
 

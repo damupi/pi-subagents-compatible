@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.1
+
 - Publish the package on npm as `pi-subagents-compatible`
 - Add trusted npm publishing through GitHub Actions releases
 - Document npm installation
