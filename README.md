@@ -92,7 +92,7 @@ Local/private runtime file:
 pi install npm:pi-subagents-compatible
 ```
 
-Pin a specific release with `pi install npm:pi-subagents-compatible@0.2.2`.
+Pin a specific release with `pi install npm:pi-subagents-compatible@0.2.3`.
 
 Mutable configuration and run artifacts are stored outside the installed npm package so package updates do not replace them.
 
@@ -321,6 +321,7 @@ Typical files:
 - `meta.json`
 - `output.txt`
 - `stderr.txt`
+- `stdout.raw.ndjson` — unmodified child protocol output for diagnostics
 - `result.summary.md`
 - `result.full.md`
 - `prompt.md`
@@ -348,6 +349,7 @@ Set `PI_SUBAGENT_RUN_RETENTION_DAYS=0` to disable automatic pruning.
 - `/subagent-inspect` opens a dedicated keyboard-driven screen for active and recent runs
 - use `↑`/`↓` to select, `Enter` for details, `s` twice to confirm stop, `r` to refresh, and `Esc` to go back or close
 - foreground and background run metadata/output are persisted for inspection through the command, `status`, `/subagent-runs`, and run artifacts
+- a child that exits successfully without recognized assistant text is treated as failed; foreground runs then try the next configured fallback model
 
 ## Security
 
