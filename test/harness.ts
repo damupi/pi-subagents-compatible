@@ -59,6 +59,12 @@ if (task.includes("SLEEP_IGNORE_TERM")) {
   marker("ready");
   setInterval(() => {}, 1000);
 } else {
+  const modelIndex = process.argv.indexOf("--model");
+  const model = modelIndex >= 0 ? process.argv[modelIndex + 1] : "";
+  if (task.includes("EMPTY_SUCCESS") && model === "fake-provider/empty-primary") {
+    emit({ type: "protocol_notice", message: "no assistant text" });
+    process.exit(0);
+  }
   if (task.includes("PARALLEL ")) {
     marker("parallel-start");
     const deadline = Date.now() + 3000;

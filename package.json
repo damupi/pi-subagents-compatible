@@ -1,6 +1,6 @@
 {
   "name": "pi-subagents-compatible",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Claude-compatible subagent workflow for Pi",
   "license": "MIT",
   "type": "module",

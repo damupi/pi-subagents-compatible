@@ -51,6 +51,70 @@ test("foreground output is reconstructed once and persisted with layered overrid
   assert.equal(record.command.includes("--thinking"), false);
 });
 
+test("empty successful foreground output triggers fallback and preserves raw protocol", async () => {
+  const tool = harness.tools.get("subagent");
+  assert.ok(tool);
+  const projectConfigPath = join(harness.projectDir, ".pi", "subagent-overrides.jsonc");
+  const originalConfig = readFileSync(projectConfigPath, "utf8");
+
+  try {
+    writeFileSync(projectConfigPath, JSON.stringify({
+      defaults: { tools: ["Bash"] },
+      agentOverrides: {
+        "test-agent": {
+          model: "fake-provider/empty-primary",
+          fallbackModels: ["fake-provider/fallback"],
+          unset: ["thinking"],
+        },
+      },
+    }, null, 2));
+
+    const result = await tool.execute("empty-fallback", {
+      agent: "test-agent",
+      task: "EMPTY_SUCCESS FOREGROUND",
+      cwd: harness.projectDir,
+    }, undefined, undefined, harness.ctx);
+
+    assert.equal(result.isError, false);
+    assert.equal(result.content[0].text, "first response\nsecond response");
+    assert.deepEqual(result.details.attemptedModels, ["fake-provider/empty-primary", "fake-provider/fallback"]);
+
+    const record = harness.records().find((item) => item.task === "EMPTY_SUCCESS FOREGROUND");
+    assert.ok(record);
+    assert.equal(record.status, "completed");
+    assert.equal(record.model, "fake-provider/fallback");
+    assert.deepEqual(record.attemptedModels, ["fake-provider/empty-primary", "fake-provider/fallback"]);
+    assert.ok(existsSync(record.rawStdoutPath));
+    const raw = readFileSync(record.rawStdoutPath, "utf8");
+    assert.match(raw, /protocol_notice/);
+    assert.match(raw, /message_update/);
+  } finally {
+    writeFileSync(projectConfigPath, originalConfig);
+  }
+});
+
+test("empty successful async output is recorded as failure with a diagnostic", async () => {
+  const tool = harness.tools.get("subagent");
+  assert.ok(tool);
+  const launched = await tool.execute("async-empty", {
+    agent: "test-agent",
+    task: "EMPTY_SUCCESS ASYNC",
+    model: "fake-provider/empty-primary",
+    async: true,
+    cwd: harness.projectDir,
+  }, undefined, undefined, harness.ctx);
+  const runId = launched.details.runId;
+
+  await waitFor(() => harness.records().some((item) => item.runId === runId && item.status === "failed"));
+  const record = harness.records().find((item) => item.runId === runId);
+  assert.ok(record);
+  assert.equal(record.exitCode, 1);
+  assert.ok(existsSync(record.rawStdoutPath));
+  assert.match(readFileSync(record.rawStdoutPath, "utf8"), /protocol_notice/);
+  assert.match(readFileSync(record.outputPath, "utf8"), /produced no recognized assistant text/);
+  assert.match(readFileSync(record.outputPath, "utf8"), /stdout\.raw\.ndjson/);
+});
+
 test("parallel and chain foreground orchestration preserve structured results", async () => {
   const tool = harness.tools.get("subagent");
   assert.ok(tool);

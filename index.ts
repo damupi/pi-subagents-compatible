@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Key, Text, isKeyRelease, isKeyRepeat, matchesKey, stripTerminalSequences, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, rmSync, statSync, writeFileSync, type Dirent } from "node:fs";
+import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, rmSync, statSync, writeFileSync, type Dirent } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -114,6 +114,7 @@ type RunRecord = {
   model?: string;
   thinking?: string;
   modelCandidates?: string[];
+  attemptedModels?: string[];
   timeoutMs?: number;
   command: string[];
   sourcePath: string;
@@ -127,6 +128,7 @@ type RunRecord = {
   stopRequestedAt?: string;
   outputPath: string;
   stderrPath: string;
+  rawStdoutPath?: string;
   metaPath: string;
   resultSummaryPath: string;
   resultFullPath: string;
@@ -1511,8 +1513,13 @@ function launchAsyncRun(
     active.timer.unref?.();
   }
 
+  const rawStdoutPath = join(runDir, "stdout.raw.ndjson");
+  record.rawStdoutPath = rawStdoutPath;
+  writeFileSync(rawStdoutPath, "", "utf8");
+  persistRunRecord(record);
   proc.stdout.setEncoding("utf8");
   proc.stdout.on("data", (chunk: string) => {
+    appendFileSync(rawStdoutPath, chunk, "utf8");
     active.stdoutBuffer += chunk;
     const lines = active.stdoutBuffer.split("\n");
     active.stdoutBuffer = lines.pop() || "";
@@ -1530,10 +1537,14 @@ function launchAsyncRun(
   proc.on("close", (code) => {
     if (active.timer) clearTimeout(active.timer);
     if (active.stdoutBuffer.trim()) consumeJsonLine(active.stdoutBuffer, active.outputChunks, (activity) => updateFleetActivity(runId, activity));
-    if (active.record.status === "running") active.record.status = code === 0 ? "completed" : "failed";
+    const emptySuccess = code === 0 && !active.record.stopped && !active.record.timedOut && !active.outputChunks.join("").trim();
+    if (emptySuccess) {
+      active.outputChunks.push(`Child Pi exited successfully but produced no recognized assistant text. Raw protocol output: ${rawStdoutPath}`);
+    }
+    if (active.record.status === "running") active.record.status = code === 0 && !emptySuccess ? "completed" : "failed";
     if (active.record.stopped) active.record.status = "stopped";
     if (active.record.timedOut) active.record.status = "timed_out";
-    active.record.exitCode = code ?? 1;
+    active.record.exitCode = emptySuccess ? 1 : code ?? 1;
     active.record.pid = undefined;
     active.record.processStartedAtMs = undefined;
     active.record.finishedAt = new Date().toISOString();
@@ -1612,6 +1623,9 @@ async function runChildAgentForeground(
   let persistedOutput = "";
   let persistedStderr = "";
   const attempted: string[] = [];
+  const rawStdoutPath = join(runDir, "stdout.raw.ndjson");
+  record.rawStdoutPath = rawStdoutPath;
+  writeFileSync(rawStdoutPath, "", "utf8");
 
   for (const candidate of candidates.length > 0 ? candidates : [undefined]) {
     let plan: ChildPlan;
@@ -1743,6 +1757,7 @@ async function runChildAgentForeground(
 
       proc.stdout.setEncoding("utf8");
       proc.stdout.on("data", (chunk: string) => {
+        appendFileSync(rawStdoutPath, chunk, "utf8");
         buffer += chunk;
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
@@ -1769,6 +1784,10 @@ async function runChildAgentForeground(
         });
         const candidateOutput = textChunks.join("");
         const candidateStderr = stderrChunks.join("");
+        const emptySuccess = code === 0 && !stopped && !timedOut && !candidateOutput.trim();
+        const emptyOutputError = emptySuccess
+          ? `Child Pi exited successfully but produced no recognized assistant text. Raw protocol output: ${rawStdoutPath}`
+          : "";
         persistedOutput += candidateOutput;
         persistedStderr += candidateStderr;
         writeFileSync(record.outputPath, persistedOutput, "utf8");
@@ -1777,11 +1796,11 @@ async function runChildAgentForeground(
           ? "Subagent cancelled."
           : timedOut
             ? candidateOutput.trim() || candidateStderr.trim() || "Subagent timed out."
-            : candidateOutput.trim() || candidateStderr.trim();
+            : candidateOutput.trim() || candidateStderr.trim() || emptyOutputError;
         settle({
           output,
           stderr: candidateStderr,
-          exitCode: stopped || timedOut ? 1 : code ?? 1,
+          exitCode: stopped || timedOut || emptySuccess ? 1 : code ?? 1,
           elapsedMs: Date.now() - startedAt,
           timedOut,
           stopped,
@@ -1862,6 +1881,7 @@ async function runChildAgentForeground(
   record.timedOut = fallback.timedOut;
   record.stopped = fallback.stopped;
   record.model = fallback.model;
+  record.attemptedModels = attempted;
   record.thinking = fallback.thinking;
   record.timeoutMs = fallback.timeoutMs;
   record.command = fallback.command;

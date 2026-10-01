@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.2.3
+
+- Capture raw child protocol output in `stdout.raw.ndjson` for foreground and async runs
+- Treat exit code 0 with no recognized assistant text as a failure instead of a successful empty result
+- Continue to the next configured fallback model after an empty successful foreground response
+- Persist the attempted model list in run metadata
+
 ## 0.2.2
 
 - Keep mutable configuration and run artifacts outside npm package installations
