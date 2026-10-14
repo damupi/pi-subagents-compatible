@@ -28,10 +28,12 @@
   ],
   "files": [
     "index.ts",
+    "router.ts",
     "README.md",
     "LICENSE",
     "overrides.schema.json",
-    "overrides.jsonc.example"
+    "overrides.jsonc.example",
+    "scripts/build-routing-eval.ts"
   ],
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
@@ -45,7 +47,8 @@
   },
   "scripts": {
     "test": "tsx --test --test-concurrency=1 test/index.test.ts",
-    "check": "node --check index.ts && npm test"
+    "check": "node --check index.ts && node --check router.ts && npm test",
+    "build:routing-eval": "node scripts/build-routing-eval.ts"
   },
   "devDependencies": {
     "tsx": "^4.23.15"

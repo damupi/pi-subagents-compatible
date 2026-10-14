@@ -1,4 +1,6 @@
 node_modules/
 overrides.jsonc
 runs/
+.pi-subagent-evals/
+*.local.jsonl
 *.log

@@ -31,7 +31,7 @@
 
     "researcher": {
       // Example of an intentional per-agent pin. Remove model/thinking to inherit parent Pi.
-      "model": "openai-codex/gpt-5.4",
+      "model": "openai-codex/gpt-5.6-sol",
       "thinking": "medium",
       "tools": ["read", "write", "grep", "find", "ls"],
       "defaultContext": "fresh",
