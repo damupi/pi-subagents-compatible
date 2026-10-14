@@ -37,6 +37,7 @@ test("route action uses Jev for advisory profile, effort, risk, desktop, and age
         usage: { input: 12, output: 4, totalTokens: 16, cost: { total: 0.001 } },
         answers: {
           profile: { type: "choice", choice: "reasoning_agent", confidence: 0.88, probabilities: { reasoning_agent: 0.88, fast_agent: 0.12 } },
+          workflow: { type: "choice", choice: "single", confidence: 0.89, probabilities: { single: 0.89, reconnaissance: 0.11 } },
           effort: { type: "score", score: 2.2, confidence: 0.91 },
           risk: { type: "score", score: 1.1, confidence: 0.86 },
           needs_desktop: { type: "bool", probability: 0.14 },
@@ -65,6 +66,7 @@ test("route action uses Jev for advisory profile, effort, risk, desktop, and age
   assert.equal(classifierContext.state.task, "Investigate a difficult test failure across several files");
   assert.equal(classifierContext.state.agents.length, 2);
   assert.ok(classifierContext.questions.agent.criteria["long-agent"].length <= 360);
+  assert.equal(classifierContext.questions.workflow.type, "choice");
   assert.equal(classifierContext.questions.effort.type, "score");
   assert.equal(classifierContext.questions.needs_desktop.type, "bool");
   assert.match(result.content[0].text, /not executed/);
@@ -129,6 +131,7 @@ test("auto routing executes one safe high-confidence specialist with effort-deri
         usage: { input: 10, output: 3, totalTokens: 13, cost: { total: 0.001 } },
         answers: {
           profile: { type: "choice", choice: "fast_agent", confidence: 0.91, probabilities: { fast_agent: 0.91, reasoning_agent: 0.09 } },
+          workflow: { type: "choice", choice: "single", confidence: 0.90, probabilities: { single: 0.90, reconnaissance: 0.10 } },
           effort: { type: "score", score: 2.1, confidence: 0.90 },
           risk: { type: "score", score: 0.1, confidence: 0.94 },
           needs_desktop: { type: "bool", probability: 0.05 },
@@ -158,6 +161,91 @@ test("auto routing executes one safe high-confidence specialist with effort-deri
   delete harness.ctx.modelRegistry;
 });
 
+test("auto routing executes the approved full-coding chain template", async () => {
+  const tool = harness.tools.get("subagent");
+  assert.ok(tool);
+  for (const name of ["planner", "builder", "reviewer"]) {
+    writeFileSync(join(harness.root, "agents", `${name}.md`), `---\nname: ${name}\ndescription: Test ${name} specialist\n---\n\nYou are the test ${name}.\n`);
+  }
+  harness.ctx.modelRegistry = {
+    async getAvailableOfType() {
+      return [{ type: "classifier", provider: "openrouter", id: "~typesafe/jev-latest" }];
+    },
+    async classify() {
+      return {
+        stopReason: "stop",
+        answers: {
+          profile: { type: "choice", choice: "reasoning_agent", confidence: 0.94, probabilities: { reasoning_agent: 0.94, fast_agent: 0.06 } },
+          workflow: { type: "choice", choice: "full_coding", confidence: 0.91, probabilities: { full_coding: 0.91, implement_review: 0.09 } },
+          effort: { type: "score", score: 2.2, confidence: 0.92 },
+          risk: { type: "score", score: 1.1, confidence: 0.88 },
+          needs_desktop: { type: "bool", probability: 0.03 },
+          agent: { type: "choice", choice: "builder", confidence: 0.80, probabilities: { builder: 0.80, planner: 0.10, reviewer: 0.10 } },
+        },
+      };
+    },
+  };
+
+  const result = await tool.execute("auto-full-coding", {
+    auto: true,
+    task: "Implement and validate the requested feature",
+    cwd: harness.projectDir,
+  }, undefined, undefined, harness.ctx);
+
+  assert.equal(result.isError, false);
+  assert.equal(result.details.action, "chain");
+  assert.equal(result.details.auto, true);
+  assert.equal(result.details.workflow, "full_coding");
+  assert.equal(result.details.routing.mode, "chain");
+  assert.deepEqual(result.details.steps.map((step: any) => step.agent), ["planner", "builder", "reviewer"]);
+  assert.ok(result.details.steps.every((step: any) => step.thinking === "high"));
+  const routedRecords = harness.records().filter((record) => record.routingDecision?.workflow === "full_coding");
+  assert.equal(routedRecords.length, 3);
+  assert.ok(routedRecords.every((record) => record.routingDecision.mode === "chain"));
+  delete harness.ctx.modelRegistry;
+});
+
+test("auto routing executes the approved independent-research parallel template", async () => {
+  const tool = harness.tools.get("subagent");
+  assert.ok(tool);
+  for (const name of ["scout", "researcher"]) {
+    writeFileSync(join(harness.root, "agents", `${name}.md`), `---\nname: ${name}\ndescription: Test ${name} specialist\n---\n\nYou are the test ${name}.\n`);
+  }
+  harness.ctx.modelRegistry = {
+    async getAvailableOfType() {
+      return [{ type: "classifier", provider: "openrouter", id: "~typesafe/jev-latest" }];
+    },
+    async classify() {
+      return {
+        stopReason: "stop",
+        answers: {
+          profile: { type: "choice", choice: "reasoning_agent", confidence: 0.90, probabilities: { reasoning_agent: 0.90, fast_agent: 0.10 } },
+          workflow: { type: "choice", choice: "independent_research", confidence: 0.88, probabilities: { independent_research: 0.88, single: 0.12 } },
+          effort: { type: "score", score: 1.8, confidence: 0.90 },
+          risk: { type: "score", score: 0.2, confidence: 0.94 },
+          needs_desktop: { type: "bool", probability: 0.04 },
+          agent: { type: "choice", choice: "researcher", confidence: 0.82, probabilities: { researcher: 0.82, scout: 0.18 } },
+        },
+      };
+    },
+  };
+
+  const result = await tool.execute("auto-independent-research", {
+    auto: true,
+    task: "Investigate the implementation and relevant external documentation",
+    cwd: harness.projectDir,
+  }, undefined, undefined, harness.ctx);
+
+  assert.equal(result.isError, false);
+  assert.equal(result.details.action, "parallel");
+  assert.equal(result.details.workflow, "independent_research");
+  assert.deepEqual(result.details.steps.map((step: any) => step.agent), ["scout", "researcher"]);
+  assert.ok(result.details.steps.every((step: any) => step.routingDecision === undefined));
+  const routedRecords = harness.records().filter((record) => record.routingDecision?.workflow === "independent_research");
+  assert.equal(routedRecords.length, 2);
+  delete harness.ctx.modelRegistry;
+});
+
 test("auto routing blocks high-risk work without launching a child", async () => {
   const tool = harness.tools.get("subagent");
   assert.ok(tool);
@@ -171,6 +259,7 @@ test("auto routing blocks high-risk work without launching a child", async () =>
         stopReason: "stop",
         answers: {
           profile: { type: "choice", choice: "fast_agent", confidence: 0.95, probabilities: { fast_agent: 0.95, human: 0.05 } },
+          workflow: { type: "choice", choice: "single", confidence: 0.92, probabilities: { single: 0.92, reconnaissance: 0.08 } },
           effort: { type: "score", score: 1, confidence: 0.90 },
           risk: { type: "score", score: 1.9, confidence: 0.96 },
           needs_desktop: { type: "bool", probability: 0.1 },

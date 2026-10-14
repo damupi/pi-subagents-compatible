@@ -46,7 +46,8 @@ Working features include:
 
 - `subagent({ action: "list" | "reload" | "route" | "status" | "stop" })`
 - advisory Jev routing for execution profile, specialist, effort, risk, and desktop access
-- opt-in Jev execution for safe, high-confidence single-agent routes
+- opt-in Jev execution for safe, high-confidence single-agent and controlled workflow routes
+- fixed Jev workflow templates for reconnaissance, implementation, review, and parallel research
 - deterministic fallback recommendations when Jev is unavailable
 - single foreground runs
 - single async/background runs
@@ -70,6 +71,7 @@ Current limitation:
 ```text
 index.ts
 router.ts
+workflow-templates.ts
 README.md
 LICENSE
 CHANGELOG.md
@@ -244,7 +246,7 @@ Routing is advisory in this release: it never starts a child process. The router
 
 Low-confidence profiles, high-risk tasks, and tasks above the 16,000-character classifier limit are routed to human review. If Jev is unavailable, unsupported by the installed Pi version, or errors, a deterministic local fallback produces a visibly marked advisory result. Jev routing requires a Pi runtime whose model registry exposes classifier models through `findOfType()` and `classify()`; older runtimes continue to support explicit subagent execution and receive fallback recommendations.
 
-### Route and run one specialist
+### Route and run a controlled workflow
 
 ```js
 subagent({
@@ -253,7 +255,18 @@ subagent({
 })
 ```
 
-Automatic execution is deliberately narrow. It runs only a `single` route with confidence of at least `0.70`, a known enabled agent, and risk below `high`. Human and deterministic-script profiles remain with the parent, and `slack-courier` always requires an explicit already-approved send request. If allowed, Jev effort maps to child thinking (`low`, `medium`, `high`, or `max` for `xhigh`) unless the caller supplies an explicit `thinking` override. Blocked routes return the recommendation and reason without launching a child process. The routing decision is persisted in the child run metadata.
+Automatic execution is deliberately narrow. It requires confidence of at least `0.70`, risk below `high`, and enabled agents for one of the fixed templates below. Jev cannot invent an execution graph.
+
+| Template | Execution |
+|---|---|
+| `single` | Jev-selected specialist |
+| `reconnaissance` | `scout` |
+| `investigate_implement` | `scout → builder` |
+| `implement_review` | `builder → reviewer` |
+| `full_coding` | `planner → builder → reviewer` |
+| `independent_research` | `scout + researcher` in parallel |
+
+Human and deterministic-script profiles remain with the parent, and `slack-courier` always requires an explicit already-approved send request. If allowed, Jev effort maps to child thinking (`low`, `medium`, `high`, or `max` for `xhigh`) unless the caller supplies an explicit `thinking` override. Automatic chain and parallel templates currently run in foreground only. Blocked routes return the recommendation and reason without launching a child process. The routing decision is persisted in every child run's metadata.
 
 ### Run one subagent
 
