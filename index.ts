@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { routeSubagentTask, type RoutingDecision } from "./router.ts";
 import { Key, Text, isKeyRelease, isKeyRepeat, matchesKey, stripTerminalSequences, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, rmSync, statSync, writeFileSync, type Dirent } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
@@ -143,6 +144,7 @@ type RunRecord = {
   totalSteps?: number;
   stepLabel?: string;
   completionSummary?: string;
+  routingDecision?: RoutingDecision;
 };
 
 type ActiveRun = {
@@ -163,6 +165,7 @@ type LiveRunControl = {
 type RunRequest = {
   task: string;
   model?: string;
+  routingDecision?: RoutingDecision;
   thinking?: string;
   cwd: string;
   timeoutMs?: number;
@@ -236,6 +239,7 @@ const FLEET_REFRESH_MS = 2000;
 const MAX_INLINE_PROGRESS_ROWS = 6;
 const MAX_OUTPUT_PREVIEW_CHARS = 2000;
 const FOREGROUND_KILL_GRACE_MS = 1000;
+const AUTO_ROUTE_MIN_CONFIDENCE = 0.70;
 const FLEET_WIDGET_KEY = "pi-subagent-fleet";
 const LEGACY_WIDGET_KEY = "pi-subagent-runs";
 const USE_LEGACY_FOOTER = false;
@@ -471,6 +475,7 @@ export default function (pi: ExtensionAPI) {
       action: Type.Optional(Type.Union([
         Type.Literal("list"),
         Type.Literal("reload"),
+        Type.Literal("route"),
         Type.Literal("status"),
         Type.Literal("stop"),
       ])),
@@ -497,12 +502,13 @@ export default function (pi: ExtensionAPI) {
       cwd: Type.Optional(Type.String({ description: "Working directory for the child run" })),
       context: Type.Optional(Type.Union([Type.Literal("fresh"), Type.Literal("fork")], { description: "fresh starts isolated; fork copies the current session into a child session file." })),
       timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Optional child timeout override in ms" })),
+      auto: Type.Optional(Type.Boolean({ description: "Use Jev to select and run one safe, high-confidence specialist." })),
       async: Type.Optional(Type.Boolean({ description: "Run in background and return a runId immediately." })),
       runId: Type.Optional(Type.String({ description: "Async run id for status or stop." })),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const input = params as {
-        action?: "list" | "reload" | "status" | "stop";
+        action?: "list" | "reload" | "route" | "status" | "stop";
         agent?: string;
         task?: string;
         tasks?: Array<{ agent: string; task: string; model?: string; thinking?: string; cwd?: string; timeoutMs?: number }>;
@@ -512,6 +518,7 @@ export default function (pi: ExtensionAPI) {
         cwd?: string;
         context?: ContextMode;
         timeoutMs?: number;
+        auto?: boolean;
         async?: boolean;
         runId?: string;
       };
@@ -525,12 +532,34 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      if (input.action === "list" || (!input.action && !input.agent && !input.tasks?.length && !input.chain?.length)) {
+      if (input.action === "list" || (!input.action && !input.agent && !input.auto && !input.task?.trim() && !input.tasks?.length && !input.chain?.length)) {
         refresh(ctx.cwd);
         refreshUi(ctx);
         return {
           content: [{ type: "text", text: renderAgentList(agents, currentProjectCwd).join("\n") }],
           details: { action: "list", count: agents.length, agents: agents.map(summarizeAgent), agentSources: getAgentSourceDirs(currentProjectCwd), configPath: CONFIG_PATH },
+        };
+      }
+
+      if (input.action === "route") {
+        if (!input.task?.trim()) return toolError("Missing task. Pass { action: 'route', task }.");
+        const runCwd = input.cwd || ctx.cwd;
+        const routeAgents = loadAgents(runCwd);
+        const decision = await routeSubagentTask({
+          task: input.task,
+          agents: routeAgents.map((agent) => ({
+            name: agent.runtimeName,
+            description: agent.description,
+            model: agent.override.model || currentParentModel(ctx),
+            thinking: agent.override.thinking,
+          })),
+          ctx,
+          signal,
+        });
+        return {
+          content: [{ type: "text", text: renderRoutingDecision(decision) }],
+          details: { action: "route", task: input.task, cwd: runCwd, decision, executed: false },
+          usage: decision.usage,
         };
       }
 
@@ -635,8 +664,37 @@ export default function (pi: ExtensionAPI) {
       }
 
       const runCwd = input.cwd || ctx.cwd;
-      const agent = resolveAgent(loadAgents(runCwd), input.agent || "");
-      if (!agent) return toolError(`Unknown agent '${input.agent}' for cwd '${runCwd}'. Run subagent({ action: 'list' }) from that project first.`);
+      if (input.auto && input.agent) return toolError("Pass either { auto: true, task } or { agent, task }, not both.");
+      let routingDecision: RoutingDecision | undefined;
+      let requestedAgent = input.agent;
+      let requestedThinking = input.thinking;
+      if (input.auto) {
+        const routeAgents = loadAgents(runCwd);
+        routingDecision = await routeSubagentTask({
+          task: input.task,
+          agents: routeAgents.map((candidate) => ({
+            name: candidate.runtimeName,
+            description: candidate.description,
+            model: candidate.override.model || currentParentModel(ctx),
+            thinking: candidate.override.thinking,
+          })),
+          ctx,
+          signal,
+        });
+        const blocked = autoRouteBlockReason(routingDecision);
+        if (blocked) {
+          return {
+            content: [{ type: "text", text: `${renderRoutingDecision(routingDecision)}\n\nAutomatic execution blocked: ${blocked}` }],
+            details: { action: "route", auto: true, task: input.task, cwd: runCwd, decision: routingDecision, executed: false, blocked },
+            usage: routingDecision.usage,
+          };
+        }
+        requestedAgent = routingDecision.agent;
+        requestedThinking ||= thinkingForEffort(routingDecision.effort);
+      }
+
+      const agent = resolveAgent(loadAgents(runCwd), requestedAgent || "");
+      if (!agent) return toolError(`Unknown agent '${requestedAgent}' for cwd '${runCwd}'. Run subagent({ action: 'list' }) from that project first.`);
       const maxDepth = agent.override.maxSubagentDepth;
       if (typeof maxDepth === "number" && currentDepth >= maxDepth) {
         return toolError(`Blocked: agent '${agent.runtimeName}' reached maxSubagentDepth ${maxDepth}.`);
@@ -645,7 +703,8 @@ export default function (pi: ExtensionAPI) {
       const request: RunRequest = {
         task: input.task,
         model: input.model,
-        thinking: input.thinking,
+        routingDecision,
+        thinking: requestedThinking,
         cwd: runCwd,
         timeoutMs: input.timeoutMs,
         depth: currentDepth + 1,
@@ -662,7 +721,8 @@ export default function (pi: ExtensionAPI) {
         refreshUi(ctx);
         return {
           content: [{ type: "text", text: `Started ${agent.runtimeName} in background. runId: ${launched.record.runId}` }],
-          details: { action: "run", mode: "async", runId: launched.record.runId, record: launched.record },
+          details: { action: "run", mode: "async", auto: Boolean(routingDecision), routing: routingDecision, runId: launched.record.runId, record: launched.record },
+          usage: routingDecision?.usage,
         };
       }
 
@@ -687,7 +747,10 @@ export default function (pi: ExtensionAPI) {
           childSessionFile: runResult.childSessionFile,
           sourcePath: agent.sourcePath,
           configPath: CONFIG_PATH,
+          auto: Boolean(routingDecision),
+          routing: routingDecision,
         },
+        usage: routingDecision?.usage,
         isError: runResult.exitCode !== 0,
       };
     },
@@ -990,6 +1053,46 @@ function formatInspectorElapsed(run: InspectorRun): string {
   return `${Math.max(0, Math.round((end - run.startedAtMs) / 1000))}s`;
 }
 
+function autoRouteBlockReason(decision: RoutingDecision): string | undefined {
+  if (decision.risk === "high") return "high-risk tasks require explicit human approval";
+  if (decision.mode !== "single") return `route mode '${decision.mode}' is not eligible for single-agent execution`;
+  if (decision.profile === "human" || decision.profile === "deterministic_script") return `execution profile '${decision.profile}' must stay with the parent or a human`;
+  if (!decision.agent) return "Jev did not select an enabled specialist";
+  if (decision.agent === "slack-courier") return "slack-courier requires an explicit, already-approved send request";
+  if (decision.confidence < AUTO_ROUTE_MIN_CONFIDENCE) {
+    return `confidence ${decision.confidence.toFixed(2)} is below the ${AUTO_ROUTE_MIN_CONFIDENCE.toFixed(2)} threshold`;
+  }
+  return undefined;
+}
+
+function thinkingForEffort(effort: RoutingDecision["effort"]): string {
+  if (effort === "xhigh") return "max";
+  return effort;
+}
+
+function renderRoutingDecision(decision: RoutingDecision): string {
+  const lines = [
+    "Subagent route recommendation (not executed)",
+    `Source: ${decision.source}${decision.classifierAvailable ? " · Jev available" : " · Jev unavailable"}`,
+    `Mode: ${decision.mode}`,
+    `Profile: ${decision.profile}`,
+    `Agent: ${decision.agent || "none"}`,
+    `Effort: ${decision.effort} (${decision.effortScore.toFixed(2)})`,
+    `Risk: ${decision.risk} (${decision.riskScore.toFixed(2)})`,
+    `Desktop access: ${decision.needsDesktopAccess ? "required" : "not required"}`,
+    `Confidence: ${Math.round(decision.confidence * 100)}%`,
+  ];
+  if (decision.classifier) lines.push(`Classifier: ${decision.classifier}`);
+  if (decision.model) lines.push(`Configured model: ${decision.model}`);
+  if (decision.thinking) lines.push(`Configured thinking: ${decision.thinking}`);
+  lines.push(`Reason: ${decision.reason}`);
+  if (decision.alternatives.length > 0) {
+    lines.push(`Alternatives: ${decision.alternatives.map((item) => `${item.agent} (${Math.round(item.probability * 100)}%)`).join(", ")}`);
+  }
+  if (decision.warnings.length > 0) lines.push("", ...decision.warnings.map((warning) => `Warning: ${warning}`));
+  return lines.join("\n");
+}
+
 function toolError(text: string) {
   return {
     content: [{ type: "text", text }],
@@ -1006,7 +1109,7 @@ function renderSubagentToolCall(args: any, theme: any) {
   }
   if (Array.isArray(args.tasks)) return new Text(`${title} ${theme.fg("accent", `parallel ×${args.tasks.length}`)}${args.async ? theme.fg("warning", " [async]") : ""}`, 0, 0);
   if (Array.isArray(args.chain)) return new Text(`${title} ${theme.fg("accent", `chain ×${args.chain.length}`)}`, 0, 0);
-  return new Text(`${title} ${theme.fg("accent", args.agent || "?")}${args.async ? theme.fg("warning", " [async]") : ""}`, 0, 0);
+  return new Text(`${title} ${theme.fg("accent", args.auto ? "auto" : args.agent || "?")}${args.async ? theme.fg("warning", " [async]") : ""}`, 0, 0);
 }
 
 function renderSubagentToolResult(result: any, options: { expanded: boolean; isPartial: boolean }, theme: any) {
@@ -1448,6 +1551,7 @@ function launchAsyncRun(
     executionMode: "async",
     agent: agent.runtimeName,
     task: options.task,
+    routingDecision: options.routingDecision,
     cwd: options.cwd,
     contextMode: plan.contextMode,
     model: plan.model,
@@ -1596,6 +1700,7 @@ async function runChildAgentForeground(
     executionMode: "foreground",
     agent: agent.runtimeName,
     task: options.task,
+    routingDecision: options.routingDecision,
     cwd: options.cwd,
     contextMode: options.context,
     model: candidates[0],
@@ -2800,6 +2905,7 @@ function appendRunEntry(pi: ExtensionAPI, record: RunRecord, phase: "started" | 
       startedAt: record.startedAt,
       finishedAt: record.finishedAt,
       summary: record.completionSummary,
+      routingDecision: record.routingDecision,
       resultSummaryPath: record.resultSummaryPath,
       resultFullPath: record.resultFullPath,
     });

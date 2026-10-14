@@ -44,7 +44,10 @@ Not guaranteed:
 
 Working features include:
 
-- `subagent({ action: "list" | "reload" | "status" | "stop" })`
+- `subagent({ action: "list" | "reload" | "route" | "status" | "stop" })`
+- advisory Jev routing for execution profile, specialist, effort, risk, and desktop access
+- opt-in Jev execution for safe, high-confidence single-agent routes
+- deterministic fallback recommendations when Jev is unavailable
 - single foreground runs
 - single async/background runs
 - async completion notifications back to the parent session
@@ -66,6 +69,7 @@ Current limitation:
 
 ```text
 index.ts
+router.ts
 README.md
 LICENSE
 CHANGELOG.md
@@ -77,6 +81,7 @@ overrides.jsonc.example
 .github/workflows/ci.yml
 test/harness.ts
 test/index.test.ts
+scripts/build-routing-eval.ts
 runs/
 ```
 
@@ -220,6 +225,36 @@ subagent({ action: "list" })
 subagent({ action: "reload" })
 ```
 
+### Inspect an automatic route
+
+```js
+subagent({
+  action: "route",
+  task: "Investigate why authentication tests fail across several files."
+})
+```
+
+Routing is advisory in this release: it never starts a child process. The router selects the first authenticated Jev classifier in this order: direct `typesafe/jev-latest`, OpenRouter `~typesafe/jev-latest`, then OpenRouter `typesafe/jev-1.13`. It sends Jev only the current task and a concise roster of enabled agents. It returns:
+
+- execution profile: deterministic script, fast agent, reasoning agent, browser agent, or human
+- recommended specialist
+- scored effort and risk levels
+- whether desktop/browser access is needed
+- confidence, alternatives, and safety warnings
+
+Low-confidence profiles, high-risk tasks, and tasks above the 16,000-character classifier limit are routed to human review. If Jev is unavailable, unsupported by the installed Pi version, or errors, a deterministic local fallback produces a visibly marked advisory result. Jev routing requires a Pi runtime whose model registry exposes classifier models through `findOfType()` and `classify()`; older runtimes continue to support explicit subagent execution and receive fallback recommendations.
+
+### Route and run one specialist
+
+```js
+subagent({
+  auto: true,
+  task: "Inspect this repository and identify where authentication is implemented."
+})
+```
+
+Automatic execution is deliberately narrow. It runs only a `single` route with confidence of at least `0.70`, a known enabled agent, and risk below `high`. Human and deterministic-script profiles remain with the parent, and `slack-courier` always requires an explicit already-approved send request. If allowed, Jev effort maps to child thinking (`low`, `medium`, `high`, or `max` for `xhigh`) unless the caller supplies an explicit `thinking` override. Blocked routes return the recommendation and reason without launching a child process. The routing decision is persisted in the child run metadata.
+
 ### Run one subagent
 
 ```js
@@ -297,6 +332,30 @@ After loading local edits:
 /reload
 ```
 
+### Build a local routing evaluation corpus
+
+Historical logs are used only by an offline corpus builder; they are not sent to Jev during normal routing.
+
+```bash
+npm run build:routing-eval
+```
+
+The script reads existing Pi session JSONL files and subagent run metadata, then writes a local ignored file at:
+
+```text
+.pi-subagent-evals/routing-cases.local.jsonl
+```
+
+Subagent runs provide provisional labels from the agent/model/thinking actually used. Ordinary Pi prompts remain unlabeled. Every new case is marked `unreviewed`; manually review and label it before treating it as ground truth. Rebuilding preserves cases whose `reviewStatus` was changed to `approved`, `corrected`, or `rejected`. Tasks above `--max-task-chars` (8,000 by default) are skipped rather than truncated so trailing constraints and case identity are not corrupted. A newly created corpus directory uses mode `0700`, and the JSONL uses mode `0600`; an existing custom parent directory is never chmodded. Override locations when needed:
+
+```bash
+npm run build:routing-eval -- \
+  --sessions ~/.pi/agent/sessions \
+  --runs ~/.pi/agent/pi-subagent/runs \
+  --out .pi-subagent-evals/routing-cases.local.jsonl \
+  --max-session-cases 500
+```
+
 Suggested manual tests:
 
 1. launch a background `researcher` run
@@ -357,6 +416,7 @@ This extension runs with your user permissions.
 
 It can:
 
+- classify the current routing task with `typesafe/jev-latest` when configured; normal routing sends only that task and the concise enabled-agent roster, not session history
 - spawn child `pi` processes
 - read/write run artifacts on disk
 - load configured child extensions
@@ -383,6 +443,8 @@ Original upstream references:
 
 - package: https://pi.dev/packages/pi-subagents
 - source: https://github.com/nicobailon/pi-subagents
+
+The advisory router follows the profile/effort/desktop decomposition demonstrated in Disler's [Ten Levels of Jev – Level 05 agent router](https://github.com/disler/ten-levels-of-jev/tree/main/apps/ten-levels/src/levels/level05), adapted to Pi's classifier model registry and this extension's live agent roster.
 
 It is **not** an official continuation or endorsed fork.
 

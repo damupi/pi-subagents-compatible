@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { after, before, test } from "node:test";
-import { existsSync, mkdirSync, readFileSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { createHarness, isProcessAlive, waitFor } from "./harness.ts";
@@ -14,6 +14,232 @@ before(async () => {
 
 after(async () => {
   await harness.cleanup();
+});
+
+test("route action uses Jev for advisory profile, effort, risk, desktop, and agent selection", async () => {
+  const tool = harness.tools.get("subagent");
+  assert.ok(tool);
+  let classifierContext: any;
+  writeFileSync(join(harness.root, "agents", "long-agent.md"), `---\nname: long-agent\ndescription: ${"Long specialist description ".repeat(30)}\n---\n\nLong-agent prompt.\n`);
+  harness.ctx.modelRegistry = {
+    async getAvailableOfType(type: string) {
+      assert.equal(type, "classifier");
+      return [
+        { type, provider: "openrouter", id: "typesafe/jev-1.13" },
+        { type, provider: "openrouter", id: "~typesafe/jev-latest" },
+      ];
+    },
+    async classify(model: any, context: any) {
+      assert.equal(`${model.provider}/${model.id}`, "openrouter/~typesafe/jev-latest");
+      classifierContext = context;
+      return {
+        stopReason: "stop",
+        usage: { input: 12, output: 4, totalTokens: 16, cost: { total: 0.001 } },
+        answers: {
+          profile: { type: "choice", choice: "reasoning_agent", confidence: 0.88, probabilities: { reasoning_agent: 0.88, fast_agent: 0.12 } },
+          effort: { type: "score", score: 2.2, confidence: 0.91 },
+          risk: { type: "score", score: 1.1, confidence: 0.86 },
+          needs_desktop: { type: "bool", probability: 0.14 },
+          agent: { type: "choice", choice: "test-agent", confidence: 0.93, probabilities: { "test-agent": 0.93, "long-agent": 0.07 } },
+        },
+      };
+    },
+  };
+
+  const result = await tool.execute("route-jev", {
+    action: "route",
+    task: "Investigate a difficult test failure across several files",
+    cwd: harness.projectDir,
+  }, undefined, undefined, harness.ctx);
+
+  assert.equal(result.isError, undefined);
+  assert.equal(result.details.executed, false);
+  assert.equal(result.details.decision.source, "jev");
+  assert.equal(result.details.decision.classifier, "openrouter/~typesafe/jev-latest");
+  assert.equal(result.details.decision.profile, "reasoning_agent");
+  assert.equal(result.details.decision.agent, "test-agent");
+  assert.equal(result.details.decision.effort, "high");
+  assert.equal(result.details.decision.risk, "medium");
+  assert.equal(result.details.decision.needsDesktopAccess, false);
+  assert.equal(result.usage.totalTokens, 16);
+  assert.equal(classifierContext.state.task, "Investigate a difficult test failure across several files");
+  assert.equal(classifierContext.state.agents.length, 2);
+  assert.ok(classifierContext.questions.agent.criteria["long-agent"].length <= 360);
+  assert.equal(classifierContext.questions.effort.type, "score");
+  assert.equal(classifierContext.questions.needs_desktop.type, "bool");
+  assert.match(result.content[0].text, /not executed/);
+  delete harness.ctx.modelRegistry;
+});
+
+test("route action falls back safely when Jev is unavailable", async () => {
+  const tool = harness.tools.get("subagent");
+  assert.ok(tool);
+  delete harness.ctx.modelRegistry;
+
+  const result = await tool.execute("route-fallback", {
+    action: "route",
+    task: "Deploy and publish the test agent change to production",
+    cwd: harness.projectDir,
+  }, undefined, undefined, harness.ctx);
+
+  assert.equal(result.details.decision.source, "fallback");
+  assert.equal(result.details.decision.classifierAvailable, false);
+  assert.equal(result.details.decision.mode, "human");
+  assert.equal(result.details.decision.risk, "high");
+  assert.match(result.content[0].text, /Jev unavailable/);
+  assert.match(result.content[0].text, /not executed/);
+});
+
+test("route action requires human review instead of truncating oversized tasks", async () => {
+  const tool = harness.tools.get("subagent");
+  assert.ok(tool);
+  let classifierCalled = false;
+  harness.ctx.modelRegistry = {
+    findOfType: () => ({}),
+    classify: async () => {
+      classifierCalled = true;
+      throw new Error("should not classify");
+    },
+  };
+
+  const result = await tool.execute("route-oversized", {
+    action: "route",
+    task: `Investigate this request ${"x".repeat(16_100)}`,
+    cwd: harness.projectDir,
+  }, undefined, undefined, harness.ctx);
+
+  assert.equal(classifierCalled, false);
+  assert.equal(result.details.decision.mode, "human");
+  assert.equal(result.details.decision.profile, "human");
+  assert.equal(result.details.decision.risk, "high");
+  assert.match(result.content[0].text, /classifier limit/);
+  delete harness.ctx.modelRegistry;
+});
+
+test("auto routing executes one safe high-confidence specialist with effort-derived thinking", async () => {
+  const tool = harness.tools.get("subagent");
+  assert.ok(tool);
+  harness.ctx.modelRegistry = {
+    async getAvailableOfType() {
+      return [{ type: "classifier", provider: "openrouter", id: "~typesafe/jev-latest" }];
+    },
+    async classify() {
+      return {
+        stopReason: "stop",
+        usage: { input: 10, output: 3, totalTokens: 13, cost: { total: 0.001 } },
+        answers: {
+          profile: { type: "choice", choice: "fast_agent", confidence: 0.91, probabilities: { fast_agent: 0.91, reasoning_agent: 0.09 } },
+          effort: { type: "score", score: 2.1, confidence: 0.90 },
+          risk: { type: "score", score: 0.1, confidence: 0.94 },
+          needs_desktop: { type: "bool", probability: 0.05 },
+          agent: { type: "choice", choice: "test-agent", confidence: 0.92, probabilities: { "test-agent": 0.92, "long-agent": 0.08 } },
+        },
+      };
+    },
+  };
+
+  const result = await tool.execute("auto-safe", {
+    auto: true,
+    task: "Inspect the test implementation and report the relevant files",
+    cwd: harness.projectDir,
+  }, undefined, undefined, harness.ctx);
+
+  assert.equal(result.isError, false);
+  assert.equal(result.details.auto, true);
+  assert.equal(result.details.agent, "test-agent");
+  assert.equal(result.details.thinking, "high");
+  assert.equal(result.details.routing.agent, "test-agent");
+  assert.equal(result.usage.totalTokens, 13);
+  const record = harness.records().find((item) => item.task === "Inspect the test implementation and report the relevant files");
+  assert.ok(record);
+  assert.equal(record.routingDecision.agent, "test-agent");
+  assert.equal(record.routingDecision.effort, "high");
+  assert.deepEqual(record.command.slice(record.command.indexOf("--thinking"), record.command.indexOf("--thinking") + 2), ["--thinking", "high"]);
+  delete harness.ctx.modelRegistry;
+});
+
+test("auto routing blocks high-risk work without launching a child", async () => {
+  const tool = harness.tools.get("subagent");
+  assert.ok(tool);
+  const recordsBefore = harness.records().length;
+  harness.ctx.modelRegistry = {
+    async getAvailableOfType() {
+      return [{ type: "classifier", provider: "openrouter", id: "~typesafe/jev-latest" }];
+    },
+    async classify() {
+      return {
+        stopReason: "stop",
+        answers: {
+          profile: { type: "choice", choice: "fast_agent", confidence: 0.95, probabilities: { fast_agent: 0.95, human: 0.05 } },
+          effort: { type: "score", score: 1, confidence: 0.90 },
+          risk: { type: "score", score: 1.9, confidence: 0.96 },
+          needs_desktop: { type: "bool", probability: 0.1 },
+          agent: { type: "choice", choice: "test-agent", confidence: 0.94, probabilities: { "test-agent": 0.94, "long-agent": 0.06 } },
+        },
+      };
+    },
+  };
+
+  const result = await tool.execute("auto-blocked", {
+    auto: true,
+    task: "Deploy and publish the test change to production",
+    cwd: harness.projectDir,
+  }, undefined, undefined, harness.ctx);
+
+  assert.equal(result.details.executed, false);
+  assert.equal(result.details.decision.risk, "high");
+  assert.match(result.details.blocked, /high-risk/);
+  assert.match(result.content[0].text, /Automatic execution blocked/);
+  assert.equal(harness.records().length, recordsBefore);
+  delete harness.ctx.modelRegistry;
+});
+
+test("routing evaluation builder uses private permissions and preserves reviewed cases", async () => {
+  const sessionsDir = join(harness.root, "eval-sessions");
+  const runsDir = join(harness.root, "eval-runs");
+  const runDir = join(runsDir, "sample-run");
+  const outPath = join(harness.root, "private-eval", "cases.local.jsonl");
+  mkdirSync(sessionsDir, { recursive: true });
+  mkdirSync(runDir, { recursive: true });
+  writeFileSync(join(sessionsDir, "sample.jsonl"), [
+    JSON.stringify({ type: "message", message: { role: "user", content: "Investigate why checkout tracking failed yesterday" } }),
+    JSON.stringify({ type: "message", message: { role: "user", content: `Oversized historical task ${"x".repeat(8_100)}` } }),
+    "",
+  ].join("\n"));
+  writeFileSync(join(runDir, "meta.json"), JSON.stringify({ task: "Review the authentication implementation", agent: "reviewer", model: "test/model", thinking: "high" }));
+
+  const scriptPath = join(import.meta.dirname, "..", "scripts", "build-routing-eval.ts");
+  const command = [scriptPath, "--sessions", sessionsDir, "--runs", runsDir, "--out", outPath, "--max-session-cases", "10"];
+  const first = spawnSync(process.execPath, command, { cwd: harness.root, encoding: "utf8" });
+  assert.equal(first.status, 0, first.stderr);
+  assert.equal(statSync(join(harness.root, "private-eval")).mode & 0o777, 0o700);
+  assert.equal(statSync(outPath).mode & 0o777, 0o600);
+
+  const records = readFileSync(outPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(records.length, 2);
+  const reviewed = records.find((item) => item.source === "subagent-run");
+  assert.ok(reviewed);
+  reviewed.reviewStatus = "approved";
+  reviewed.expected.agent = "manually-reviewed-agent";
+  writeFileSync(outPath, `${records.map((item) => JSON.stringify(item)).join("\n")}\n`);
+
+  const second = spawnSync(process.execPath, command, { cwd: harness.root, encoding: "utf8" });
+  assert.equal(second.status, 0, second.stderr);
+  const rebuilt = readFileSync(outPath, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+  const preserved = rebuilt.find((item) => item.id === reviewed.id);
+  assert.equal(preserved.reviewStatus, "approved");
+  assert.equal(preserved.expected.agent, "manually-reviewed-agent");
+  assert.equal(statSync(outPath).mode & 0o777, 0o600);
+
+  const sharedDir = join(harness.root, "shared-output");
+  const sharedOut = join(sharedDir, "cases.local.jsonl");
+  mkdirSync(sharedDir, { mode: 0o755 });
+  chmodSync(sharedDir, 0o755);
+  const customOutputCommand = [scriptPath, "--sessions", sessionsDir, "--runs", runsDir, "--out", sharedOut, "--max-session-cases", "10"];
+  const customOutput = spawnSync(process.execPath, customOutputCommand, { cwd: harness.root, encoding: "utf8" });
+  assert.equal(customOutput.status, 0, customOutput.stderr);
+  assert.equal(statSync(sharedDir).mode & 0o777, 0o755);
+  assert.equal(statSync(sharedOut).mode & 0o777, 0o600);
 });
 
 test("foreground output is reconstructed once and persisted with layered overrides", async () => {
