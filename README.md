@@ -265,6 +265,9 @@ Automatic execution is deliberately narrow. It requires confidence of at least `
 | `implement_review` | `builder → reviewer` |
 | `full_coding` | `planner → builder → reviewer` |
 | `independent_research` | `scout + researcher` in parallel |
+| `unclassified` | Do not execute; return control to the parent agent or human |
+
+Templates are optional shortcuts rather than an exhaustive taxonomy. When none clearly fits, Jev selects `unclassified`. For low- or medium-risk work, the parent agent may construct an explicit one-off `{ agent, task }`, `tasks`, or `chain` call. High-risk, ambiguous, or side-effectful work returns to the user for approval. Jev never invents an executable graph.
 
 Human and deterministic-script profiles remain with the parent, and `slack-courier` always requires an explicit already-approved send request. If allowed, Jev effort maps to child thinking (`low`, `medium`, `high`, or `max` for `xhigh`) unless the caller supplies an explicit `thinking` override. Automatic chain and parallel templates currently run in foreground only. Blocked routes return the recommendation and reason without launching a child process. The routing decision is persisted in every child run's metadata.
 

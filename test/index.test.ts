@@ -161,6 +161,45 @@ test("auto routing executes one safe high-confidence specialist with effort-deri
   delete harness.ctx.modelRegistry;
 });
 
+test("auto routing returns unclassified workflows to the main agent without execution", async () => {
+  const tool = harness.tools.get("subagent");
+  assert.ok(tool);
+  assert.match((tool as any).description, /unclassified/);
+  const recordsBefore = harness.records().length;
+  harness.ctx.modelRegistry = {
+    async getAvailableOfType() {
+      return [{ type: "classifier", provider: "openrouter", id: "~typesafe/jev-latest" }];
+    },
+    async classify() {
+      return {
+        stopReason: "stop",
+        answers: {
+          profile: { type: "choice", choice: "reasoning_agent", confidence: 0.91, probabilities: { reasoning_agent: 0.91, fast_agent: 0.09 } },
+          workflow: { type: "choice", choice: "unclassified", confidence: 0.87, probabilities: { unclassified: 0.87, single: 0.13 } },
+          effort: { type: "score", score: 2, confidence: 0.90 },
+          risk: { type: "score", score: 0.3, confidence: 0.93 },
+          needs_desktop: { type: "bool", probability: 0.06 },
+          agent: { type: "choice", choice: "test-agent", confidence: 0.84, probabilities: { "test-agent": 0.84, "long-agent": 0.16 } },
+        },
+      };
+    },
+  };
+
+  const result = await tool.execute("auto-unclassified", {
+    auto: true,
+    task: "Coordinate an unusual one-off workflow that has no reviewed template",
+    cwd: harness.projectDir,
+  }, undefined, undefined, harness.ctx);
+
+  assert.equal(result.details.executed, false);
+  assert.equal(result.details.handoff, "main");
+  assert.equal(result.details.decision.workflow, "unclassified");
+  assert.equal(result.details.decision.mode, "main");
+  assert.match(result.content[0].text, /explicit one-off agent, parallel tasks, or chain/);
+  assert.equal(harness.records().length, recordsBefore);
+  delete harness.ctx.modelRegistry;
+});
+
 test("auto routing executes the approved full-coding chain template", async () => {
   const tool = harness.tools.get("subagent");
   assert.ok(tool);
@@ -277,6 +316,7 @@ test("auto routing blocks high-risk work without launching a child", async () =>
 
   assert.equal(result.details.executed, false);
   assert.equal(result.details.decision.risk, "high");
+  assert.equal(result.details.handoff, "human");
   assert.match(result.details.blocked, /high-risk/);
   assert.match(result.content[0].text, /Automatic execution blocked/);
   assert.equal(harness.records().length, recordsBefore);

@@ -471,7 +471,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description: "List or run shared subagents using Pi-native overrides and a Claude-compatible subagent workflow.",
+    description: "List or run shared subagents. For non-trivial investigation, implementation, review, or research where delegation adds value, use { auto: true, task }. Jev may run an approved workflow or return unclassified; when unclassified, the parent should choose an explicit agent/tasks/chain or ask the user rather than forcing a template.",
     parameters: Type.Object({
       action: Type.Optional(Type.Union([
         Type.Literal("list"),
@@ -1098,6 +1098,7 @@ function formatInspectorElapsed(run: InspectorRun): string {
 
 function autoRouteBlockReason(decision: RoutingDecision): string | undefined {
   if (decision.risk === "high") return "high-risk tasks require explicit human approval";
+  if (decision.workflow === "unclassified") return "no reviewed workflow matched; the parent agent or human must choose an explicit one-off workflow";
   if (decision.mode === "human" || decision.mode === "main") return `route mode '${decision.mode}' must stay with the parent or a human`;
   if (decision.profile === "human" || decision.profile === "deterministic_script") return `execution profile '${decision.profile}' must stay with the parent or a human`;
   if (decision.workflow === "single" && !decision.agent) return "Jev did not select an enabled specialist";
@@ -1109,9 +1110,13 @@ function autoRouteBlockReason(decision: RoutingDecision): string | undefined {
 }
 
 function blockedAutoRouteResult(task: string, cwd: string, decision: RoutingDecision, blocked: string) {
+  const handoff = decision.risk === "high" || decision.profile === "human" ? "human" : "main";
+  const next = handoff === "human"
+    ? "Ask the user to choose or approve the workflow."
+    : "The parent agent may construct an explicit one-off agent, parallel tasks, or chain call.";
   return {
-    content: [{ type: "text", text: `${renderRoutingDecision(decision)}\n\nAutomatic execution blocked: ${blocked}` }],
-    details: { action: "route", auto: true, task, cwd, decision, executed: false, blocked },
+    content: [{ type: "text", text: `${renderRoutingDecision(decision)}\n\nAutomatic execution blocked: ${blocked}\nNext: ${next}` }],
+    details: { action: "route", auto: true, task, cwd, decision, executed: false, blocked, handoff },
     usage: decision.usage,
   };
 }
