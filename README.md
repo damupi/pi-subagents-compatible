@@ -47,6 +47,7 @@ Working features include:
 - `subagent({ action: "list" | "reload" | "route" | "status" | "stop" })`
 - advisory Jev routing for execution profile, specialist, effort, risk, and desktop access
 - opt-in Jev execution for safe, high-confidence single-agent and controlled workflow routes
+- persistent `/subagents-auto on|off|status` safety switch for Jev automatic execution
 - fixed Jev workflow templates for reconnaissance, implementation, review, and parallel research
 - deterministic fallback recommendations when Jev is unavailable
 - single foreground runs
@@ -247,6 +248,16 @@ Routing is advisory in this release: it never starts a child process. The router
 Low-confidence profiles, high-risk tasks, and tasks above the 16,000-character classifier limit are routed to human review. If Jev is unavailable, unsupported by the installed Pi version, or errors, a deterministic local fallback produces a visibly marked advisory result. Jev routing requires a Pi runtime whose model registry exposes classifier models through `findOfType()` and `classify()`; older runtimes continue to support explicit subagent execution and receive fallback recommendations.
 
 ### Route and run a controlled workflow
+
+Automatic routing is enabled by default. Control it with:
+
+```text
+/subagents-auto on
+/subagents-auto off
+/subagents-auto status
+```
+
+The setting persists across Pi reloads. When it is off, `auto: true` calls are blocked; explicit `{ agent, task }`, `tasks`, and `chain` calls continue to work.
 
 ```js
 subagent({

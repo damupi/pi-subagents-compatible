@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Add persistent `/subagents-auto on|off|status` control for Jev automatic routing
+- Block `auto: true` execution while the global switch is off, while preserving explicit agent, parallel, and chain calls
+- Tell the main agent whether automatic subagent routing is currently enabled
+
 ## 0.2.3
 
 - Capture raw child protocol output in `stdout.raw.ndjson` for foreground and async runs
