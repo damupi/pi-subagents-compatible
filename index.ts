@@ -220,6 +220,7 @@ const AUTO_DATA_DIR = existsSync(join(LEGACY_DATA_DIR, "overrides.jsonc")) || ex
 const DATA_DIR = resolveConfiguredPath(process.env.PI_SUBAGENT_DATA_DIR, AUTO_DATA_DIR);
 const ENV_AGENT_DIR = process.env.PI_SUBAGENT_AGENT_DIR?.trim() ? resolve(process.env.PI_SUBAGENT_AGENT_DIR.trim()) : undefined;
 const CONFIG_PATH = resolveConfiguredPath(process.env.PI_SUBAGENT_CONFIG_PATH, join(DATA_DIR, "overrides.jsonc"));
+const AUTO_ROUTING_STATE_PATH = join(DATA_DIR, "auto-routing.json");
 const PROJECT_CONFIG_RELATIVE_PATH = join(".pi", "subagent-overrides.jsonc");
 const SCHEMA_PATH = join(EXTENSION_DIR, "overrides.schema.json");
 const RUNS_DIR = resolveConfiguredPath(process.env.PI_SUBAGENT_RUNS_DIR, join(DATA_DIR, "runs"));
@@ -268,6 +269,7 @@ export default function (pi: ExtensionAPI) {
   let widgetSummaryText = "";
   let currentSessionId: string | undefined;
   let currentProjectCwd = process.cwd();
+  let autoRoutingEnabled = loadAutoRoutingEnabled();
   let lastStatusText: string | undefined;
 
   function refresh(cwd?: string) {
@@ -421,6 +423,15 @@ export default function (pi: ExtensionAPI) {
     cleanupUi();
   });
 
+  pi.on("before_agent_start", async (event) => {
+    const guideline = autoRoutingEnabled
+      ? "Subagent automatic routing is enabled. For non-trivial work where delegation adds value, prefer subagent({ auto: true, task })."
+      : "Subagent automatic routing is disabled. Do not call subagent with auto: true; use an explicit agent, tasks, or chain instead.";
+    if (!event.systemPromptOptions.promptGuidelines.includes(guideline)) {
+      event.systemPromptOptions.promptGuidelines.push(guideline);
+    }
+  });
+
   pi.registerCommand("subagents", {
     description: "List shared subagents",
     handler: async (_args, ctx) => {
@@ -436,6 +447,22 @@ export default function (pi: ExtensionAPI) {
       refresh(ctx.cwd);
       refreshUi(ctx);
       ctx.ui.notify(`reloaded ${agents.length} subagents from ${describeAgentSources(currentProjectCwd)}`, "info");
+    },
+  });
+
+  pi.registerCommand("subagents-auto", {
+    description: "Switch Jev automatic subagent routing on or off",
+    handler: async (args, ctx) => {
+      const requested = args.trim().toLowerCase();
+      if (requested && requested !== "on" && requested !== "off" && requested !== "status") {
+        ctx.ui.notify("Usage: /subagents-auto on|off|status", "warning");
+        return;
+      }
+      if (requested === "on" || requested === "off") {
+        autoRoutingEnabled = requested === "on";
+        persistAutoRoutingEnabled(autoRoutingEnabled);
+      }
+      ctx.ui.notify(`Subagent automatic routing is ${autoRoutingEnabled ? "on" : "off"}.`, "info");
     },
   });
 
@@ -666,6 +693,7 @@ export default function (pi: ExtensionAPI) {
 
       const runCwd = input.cwd || ctx.cwd;
       if (input.auto && input.agent) return toolError("Pass either { auto: true, task } or { agent, task }, not both.");
+      if (input.auto && !autoRoutingEnabled) return toolError("Automatic subagent routing is disabled. Run /subagents-auto on to enable it.");
       let routingDecision: RoutingDecision | undefined;
       let workflowPlan: WorkflowPlan | undefined;
       let requestedAgent = input.agent;
@@ -3096,6 +3124,21 @@ function parseMarkdownAgent(raw: string): { frontmatter: JsonObject; body: strin
     frontmatter: parseYamlSubset(raw.slice(4, end)),
     body: raw.slice(end + 5).trim(),
   };
+}
+
+function loadAutoRoutingEnabled(): boolean {
+  try {
+    if (!existsSync(AUTO_ROUTING_STATE_PATH)) return true;
+    const parsed = JSON.parse(readFileSync(AUTO_ROUTING_STATE_PATH, "utf8"));
+    return parsed?.enabled !== false;
+  } catch {
+    return true;
+  }
+}
+
+function persistAutoRoutingEnabled(enabled: boolean) {
+  mkdirSync(dirname(AUTO_ROUTING_STATE_PATH), { recursive: true });
+  writeFileSync(AUTO_ROUTING_STATE_PATH, `${JSON.stringify({ enabled }, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
 }
 
 function parseJsonc(input: string): JsonObject {

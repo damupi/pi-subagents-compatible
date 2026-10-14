@@ -737,6 +737,41 @@ test("retention deletes only expired owned run directories", async () => {
   }
 });
 
+test("subagents-auto command persistently enables and disables automatic routing", async () => {
+  const isolated = await createHarness({ dataPathMode: "data-env" });
+  try {
+    const command = isolated.commands.get("subagents-auto");
+    const tool = isolated.tools.get("subagent");
+    assert.ok(command);
+    assert.ok(tool);
+
+    await command.handler("off", isolated.ctx);
+    const statePath = join(isolated.dataDir, "auto-routing.json");
+    assert.deepEqual(JSON.parse(readFileSync(statePath, "utf8")), { enabled: false });
+    assert.equal(statSync(statePath).mode & 0o777, 0o600);
+
+    const disabled = await tool.execute("auto-disabled", {
+      auto: true,
+      task: "Inspect this repository",
+      cwd: isolated.projectDir,
+    }, undefined, undefined, isolated.ctx);
+    assert.equal(disabled.isError, true);
+    assert.match(disabled.content[0].text, /\/subagents-auto on/);
+
+    const disabledPrompt = { systemPromptOptions: { promptGuidelines: [] as string[] } };
+    await isolated.emitEvent("before_agent_start", disabledPrompt);
+    assert.match(disabledPrompt.systemPromptOptions.promptGuidelines[0]!, /disabled/);
+
+    await command.handler("on", isolated.ctx);
+    assert.deepEqual(JSON.parse(readFileSync(statePath, "utf8")), { enabled: true });
+    const enabledPrompt = { systemPromptOptions: { promptGuidelines: [] as string[] } };
+    await isolated.emitEvent("before_agent_start", enabledPrompt);
+    assert.match(enabledPrompt.systemPromptOptions.promptGuidelines[0]!, /enabled/);
+  } finally {
+    await isolated.cleanup();
+  }
+});
+
 test("mutable data stays outside the package and existing legacy data is reused", async () => {
   for (const dataPathMode of ["default", "legacy", "data-env"] as const) {
     const isolated = await createHarness({ dataPathMode });
