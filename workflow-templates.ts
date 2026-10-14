@@ -6,7 +6,8 @@ export type WorkflowTemplateId =
   | "investigate_implement"
   | "implement_review"
   | "full_coding"
-  | "independent_research";
+  | "independent_research"
+  | "unclassified";
 
 export type WorkflowPlan = {
   id: WorkflowTemplateId;
@@ -21,9 +22,10 @@ export const WORKFLOW_CRITERIA: Record<WorkflowTemplateId, string> = {
   implement_review: "Builder should implement a defined change and Reviewer should validate it",
   full_coding: "The task needs explicit planning, implementation, and independent review",
   independent_research: "Scout and Researcher should investigate independent angles in parallel",
+  unclassified: "None of the reviewed workflows clearly fits; return control to the parent agent or human instead of forcing a template",
 };
 
-const TEMPLATE_AGENTS: Record<Exclude<WorkflowTemplateId, "single">, string[]> = {
+const TEMPLATE_AGENTS: Record<Exclude<WorkflowTemplateId, "single" | "unclassified">, string[]> = {
   reconnaissance: ["scout"],
   investigate_implement: ["scout", "builder"],
   implement_review: ["builder", "reviewer"],
@@ -37,6 +39,7 @@ export function resolveWorkflowPlan(
   availableAgents: ReadonlySet<string>,
 ): { plan?: WorkflowPlan; error?: string } {
   const id = decision.workflow;
+  if (id === "unclassified") return { error: "no reviewed workflow matched; the parent agent or human must choose an explicit one-off workflow" };
   const agentNames = id === "single" ? (decision.agent ? [decision.agent] : []) : TEMPLATE_AGENTS[id];
   if (agentNames.length === 0) return { error: "Jev did not select a specialist for the single-agent workflow" };
   const missing = agentNames.filter((agent) => !availableAgents.has(agent));

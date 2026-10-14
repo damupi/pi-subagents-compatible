@@ -161,7 +161,7 @@ export async function routeSubagentTask(input: {
       : probabilityFor(profileAnswer, rawProfile);
     const profile: AgentProfile = profileConfidence < 0.5 ? "human" : rawProfile;
     const workflowAnswer = result.answers?.workflow as ChoiceAnswer | undefined;
-    const workflow = choice(workflowAnswer, ["single", "reconnaissance", "investigate_implement", "implement_review", "full_coding", "independent_research"] as const, "single");
+    const workflow = choice(workflowAnswer, ["single", "reconnaissance", "investigate_implement", "implement_review", "full_coding", "independent_research", "unclassified"] as const, "unclassified");
     const workflowConfidence = typeof workflowAnswer?.confidence === "number"
       ? workflowAnswer.confidence
       : probabilityFor(workflowAnswer, workflow);
@@ -173,11 +173,13 @@ export async function routeSubagentTask(input: {
     const rankedAgents = rankProbabilities(result.answers?.agent as ChoiceAnswer | undefined, new Set(candidates.map((agent) => agent.name)));
     const selected = candidates.find((agent) => agent.name === rankedAgents[0]?.agent);
     const agentConfidence = selected ? rankedAgents[0]?.probability ?? 0 : 0;
-    const workflowMode: RouteMode = workflow === "independent_research"
-      ? "parallel"
-      : workflow === "investigate_implement" || workflow === "implement_review" || workflow === "full_coding"
-        ? "chain"
-        : "single";
+    const workflowMode: RouteMode = workflow === "unclassified"
+      ? "main"
+      : workflow === "independent_research"
+        ? "parallel"
+        : workflow === "investigate_implement" || workflow === "implement_review" || workflow === "full_coding"
+          ? "chain"
+          : "single";
     const confidence = Math.min(
       profileConfidence,
       workflowConfidence || profileConfidence,
@@ -191,6 +193,7 @@ export async function routeSubagentTask(input: {
     const warnings: string[] = [];
     if (!selected && mode === "single" && workflow === "single") warnings.push("Jev did not return a valid agent; no specialist was selected.");
     if (profileConfidence < 0.5) warnings.push("Execution-profile confidence is below 0.50; routed to human review.");
+    if (workflow === "unclassified") warnings.push("No reviewed workflow matched; return control to the parent agent or human for an explicit one-off workflow.");
     if (workflowConfidence < 0.6) warnings.push("Workflow confidence is below 0.60; keep this recommendation advisory.");
     if (agentConfidence < 0.6 && mode === "single" && workflow === "single") warnings.push("Agent confidence is below 0.60; keep this recommendation advisory.");
     if (risk === "high") warnings.push("High-risk work requires explicit human approval before execution.");
