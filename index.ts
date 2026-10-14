@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { routeSubagentTask, type RoutingDecision } from "./router.ts";
+import { resolveWorkflowPlan, type WorkflowPlan } from "./workflow-templates.ts";
 import { Key, Text, isKeyRelease, isKeyRepeat, matchesKey, stripTerminalSequences, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, rmSync, statSync, writeFileSync, type Dirent } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
@@ -666,6 +667,7 @@ export default function (pi: ExtensionAPI) {
       const runCwd = input.cwd || ctx.cwd;
       if (input.auto && input.agent) return toolError("Pass either { auto: true, task } or { agent, task }, not both.");
       let routingDecision: RoutingDecision | undefined;
+      let workflowPlan: WorkflowPlan | undefined;
       let requestedAgent = input.agent;
       let requestedThinking = input.thinking;
       if (input.auto) {
@@ -682,15 +684,56 @@ export default function (pi: ExtensionAPI) {
           signal,
         });
         const blocked = autoRouteBlockReason(routingDecision);
-        if (blocked) {
+        if (blocked) return blockedAutoRouteResult(input.task, runCwd, routingDecision, blocked);
+        const resolvedWorkflow = resolveWorkflowPlan(routingDecision, input.task, new Set(routeAgents.map((candidate) => candidate.runtimeName)));
+        if (!resolvedWorkflow.plan) {
+          return blockedAutoRouteResult(input.task, runCwd, routingDecision, resolvedWorkflow.error || "workflow could not be resolved");
+        }
+        workflowPlan = resolvedWorkflow.plan;
+        requestedThinking ||= thinkingForEffort(routingDecision.effort);
+
+        if (workflowPlan.mode !== "single") {
+          if (input.async) return blockedAutoRouteResult(input.task, runCwd, routingDecision, "automatic chain and parallel workflows currently run in foreground only");
+          const steps = resolveRequestedTasks(workflowPlan.steps.map((step) => ({
+            ...step,
+            model: input.model,
+            thinking: requestedThinking,
+            cwd: runCwd,
+            timeoutMs: input.timeoutMs,
+          })), currentDepth, runCwd);
+          if (steps.error) return blockedAutoRouteResult(input.task, runCwd, routingDecision, steps.error);
+          const workflowOptions = {
+            cwd: runCwd,
+            depth: currentDepth + 1,
+            context: requestedContext,
+            parentSessionId,
+            parentSessionFile,
+            timeoutMs: input.timeoutMs,
+            routingDecision,
+            signal,
+            onUpdate,
+            liveRunControls,
+          };
+          if (workflowPlan.mode === "chain") {
+            const result = await runChainForeground(steps.value, workflowOptions, ctx);
+            refreshUi(ctx);
+            return {
+              content: [{ type: "text", text: renderChainResult(result) }],
+              details: { action: "chain", auto: true, workflow: workflowPlan.id, routing: routingDecision, ...result },
+              usage: routingDecision.usage,
+              isError: result.stopped || result.steps.some((step) => step.exitCode !== 0),
+            };
+          }
+          const result = await runParallelForeground(steps.value, workflowOptions, ctx);
+          refreshUi(ctx);
           return {
-            content: [{ type: "text", text: `${renderRoutingDecision(routingDecision)}\n\nAutomatic execution blocked: ${blocked}` }],
-            details: { action: "route", auto: true, task: input.task, cwd: runCwd, decision: routingDecision, executed: false, blocked },
+            content: [{ type: "text", text: renderParallelResult(result) }],
+            details: { action: "parallel", auto: true, workflow: workflowPlan.id, routing: routingDecision, ...result },
             usage: routingDecision.usage,
+            isError: result.stopped || result.steps.some((step) => step.exitCode !== 0),
           };
         }
-        requestedAgent = routingDecision.agent;
-        requestedThinking ||= thinkingForEffort(routingDecision.effort);
+        requestedAgent = workflowPlan.steps[0]!.agent;
       }
 
       const agent = resolveAgent(loadAgents(runCwd), requestedAgent || "");
@@ -1055,14 +1098,22 @@ function formatInspectorElapsed(run: InspectorRun): string {
 
 function autoRouteBlockReason(decision: RoutingDecision): string | undefined {
   if (decision.risk === "high") return "high-risk tasks require explicit human approval";
-  if (decision.mode !== "single") return `route mode '${decision.mode}' is not eligible for single-agent execution`;
+  if (decision.mode === "human" || decision.mode === "main") return `route mode '${decision.mode}' must stay with the parent or a human`;
   if (decision.profile === "human" || decision.profile === "deterministic_script") return `execution profile '${decision.profile}' must stay with the parent or a human`;
-  if (!decision.agent) return "Jev did not select an enabled specialist";
-  if (decision.agent === "slack-courier") return "slack-courier requires an explicit, already-approved send request";
+  if (decision.workflow === "single" && !decision.agent) return "Jev did not select an enabled specialist";
+  if (decision.workflow === "single" && decision.agent === "slack-courier") return "slack-courier requires an explicit, already-approved send request";
   if (decision.confidence < AUTO_ROUTE_MIN_CONFIDENCE) {
     return `confidence ${decision.confidence.toFixed(2)} is below the ${AUTO_ROUTE_MIN_CONFIDENCE.toFixed(2)} threshold`;
   }
   return undefined;
+}
+
+function blockedAutoRouteResult(task: string, cwd: string, decision: RoutingDecision, blocked: string) {
+  return {
+    content: [{ type: "text", text: `${renderRoutingDecision(decision)}\n\nAutomatic execution blocked: ${blocked}` }],
+    details: { action: "route", auto: true, task, cwd, decision, executed: false, blocked },
+    usage: decision.usage,
+  };
 }
 
 function thinkingForEffort(effort: RoutingDecision["effort"]): string {
@@ -1076,6 +1127,7 @@ function renderRoutingDecision(decision: RoutingDecision): string {
     `Source: ${decision.source}${decision.classifierAvailable ? " · Jev available" : " · Jev unavailable"}`,
     `Mode: ${decision.mode}`,
     `Profile: ${decision.profile}`,
+    `Workflow: ${decision.workflow} (${Math.round(decision.workflowConfidence * 100)}%)`,
     `Agent: ${decision.agent || "none"}`,
     `Effort: ${decision.effort} (${decision.effortScore.toFixed(2)})`,
     `Risk: ${decision.risk} (${decision.riskScore.toFixed(2)})`,
@@ -1202,7 +1254,7 @@ function resolveRequestedTasks(
 
 async function runParallelForeground(
   steps: Array<{ agent: AgentDef; task: string; model?: string; thinking?: string; cwd?: string; timeoutMs?: number }>,
-  options: { cwd: string; depth: number; context?: ContextMode; parentSessionId?: string; parentSessionFile?: string; timeoutMs?: number; signal?: AbortSignal; onUpdate?: (result: any) => void; liveRunControls?: Map<string, LiveRunControl> },
+  options: { cwd: string; depth: number; context?: ContextMode; parentSessionId?: string; parentSessionFile?: string; timeoutMs?: number; routingDecision?: RoutingDecision; signal?: AbortSignal; onUpdate?: (result: any) => void; liveRunControls?: Map<string, LiveRunControl> },
   ctx: any,
 ) {
   const groupId = createRunId("parallel-fg");
@@ -1220,6 +1272,7 @@ async function runParallelForeground(
   const promises = steps.map((step, index) => runChildAgentForeground(step.agent, {
     task: step.task,
     model: step.model,
+    routingDecision: options.routingDecision,
     thinking: step.thinking,
     cwd: step.cwd || options.cwd,
     timeoutMs: step.timeoutMs ?? options.timeoutMs,
@@ -1270,7 +1323,7 @@ async function runParallelForeground(
 
 async function runChainForeground(
   steps: Array<{ agent: AgentDef; task: string; model?: string; thinking?: string; cwd?: string; timeoutMs?: number }>,
-  options: { cwd: string; depth: number; context?: ContextMode; parentSessionId?: string; parentSessionFile?: string; timeoutMs?: number; signal?: AbortSignal; onUpdate?: (result: any) => void; liveRunControls?: Map<string, LiveRunControl> },
+  options: { cwd: string; depth: number; context?: ContextMode; parentSessionId?: string; parentSessionFile?: string; timeoutMs?: number; routingDecision?: RoutingDecision; signal?: AbortSignal; onUpdate?: (result: any) => void; liveRunControls?: Map<string, LiveRunControl> },
   ctx: any,
 ) {
   const groupId = createRunId("chain-fg");
@@ -1292,6 +1345,7 @@ async function runChainForeground(
     const result = await runChildAgentForeground(step.agent, {
       task,
       model: step.model,
+      routingDecision: options.routingDecision,
       thinking: step.thinking,
       cwd: step.cwd || options.cwd,
       timeoutMs: step.timeoutMs ?? options.timeoutMs,

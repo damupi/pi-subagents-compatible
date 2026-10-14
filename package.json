@@ -29,6 +29,7 @@
   "files": [
     "index.ts",
     "router.ts",
+    "workflow-templates.ts",
     "README.md",
     "LICENSE",
     "overrides.schema.json",
@@ -47,7 +48,7 @@
   },
   "scripts": {
     "test": "tsx --test --test-concurrency=1 test/index.test.ts",
-    "check": "node --check index.ts && node --check router.ts && npm test",
+    "check": "node --check index.ts && node --check router.ts && node --check workflow-templates.ts && npm test",
     "build:routing-eval": "node scripts/build-routing-eval.ts"
   },
   "devDependencies": {

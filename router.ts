@@ -1,3 +1,5 @@
+import { WORKFLOW_CRITERIA, type WorkflowTemplateId } from "./workflow-templates.ts";
+
 export type AgentCandidate = {
   name: string;
   description: string;
@@ -5,7 +7,7 @@ export type AgentCandidate = {
   thinking?: string;
 };
 
-export type RouteMode = "main" | "single" | "human";
+export type RouteMode = "main" | "single" | "chain" | "parallel" | "human";
 export type AgentProfile = "deterministic_script" | "fast_agent" | "reasoning_agent" | "browser_agent" | "human";
 export type RouteEffort = "low" | "medium" | "high" | "xhigh";
 export type RouteRisk = "low" | "medium" | "high";
@@ -13,6 +15,8 @@ export type RouteRisk = "low" | "medium" | "high";
 export type RoutingDecision = {
   mode: RouteMode;
   profile: AgentProfile;
+  workflow: WorkflowTemplateId;
+  workflowConfidence: number;
   agent?: string;
   effort: RouteEffort;
   effortScore: number;
@@ -100,6 +104,11 @@ export async function routeSubagentTask(input: {
               human: "The request is too ambiguous, sensitive, or consequential to execute without human judgment",
             },
           },
+          workflow: {
+            type: "choice",
+            instructions: "Choose the smallest approved workflow that can complete the task reliably. Do not invent another workflow.",
+            criteria: WORKFLOW_CRITERIA,
+          },
           effort: {
             type: "score",
             instructions: "How much reasoning effort is required to complete the task reliably?",
@@ -151,6 +160,11 @@ export async function routeSubagentTask(input: {
       ? profileAnswer.confidence
       : probabilityFor(profileAnswer, rawProfile);
     const profile: AgentProfile = profileConfidence < 0.5 ? "human" : rawProfile;
+    const workflowAnswer = result.answers?.workflow as ChoiceAnswer | undefined;
+    const workflow = choice(workflowAnswer, ["single", "reconnaissance", "investigate_implement", "implement_review", "full_coding", "independent_research"] as const, "single");
+    const workflowConfidence = typeof workflowAnswer?.confidence === "number"
+      ? workflowAnswer.confidence
+      : probabilityFor(workflowAnswer, workflow);
     const effortScore = scoreValue(result.answers?.effort as ScoreAnswer | undefined, 1);
     const riskScore = scoreValue(result.answers?.risk as ScoreAnswer | undefined, 1);
     const effort = effortFromScore(effortScore);
@@ -159,22 +173,34 @@ export async function routeSubagentTask(input: {
     const rankedAgents = rankProbabilities(result.answers?.agent as ChoiceAnswer | undefined, new Set(candidates.map((agent) => agent.name)));
     const selected = candidates.find((agent) => agent.name === rankedAgents[0]?.agent);
     const agentConfidence = selected ? rankedAgents[0]?.probability ?? 0 : 0;
-    const confidence = Math.min(profileConfidence, agentConfidence || profileConfidence);
+    const workflowMode: RouteMode = workflow === "independent_research"
+      ? "parallel"
+      : workflow === "investigate_implement" || workflow === "implement_review" || workflow === "full_coding"
+        ? "chain"
+        : "single";
+    const confidence = Math.min(
+      profileConfidence,
+      workflowConfidence || profileConfidence,
+      workflow === "single" ? agentConfidence || profileConfidence : profileConfidence,
+    );
     const mode: RouteMode = profile === "human" || risk === "high"
       ? "human"
       : profile === "deterministic_script"
         ? "main"
-        : "single";
+        : workflowMode;
     const warnings: string[] = [];
-    if (!selected && mode === "single") warnings.push("Jev did not return a valid agent; no specialist was selected.");
+    if (!selected && mode === "single" && workflow === "single") warnings.push("Jev did not return a valid agent; no specialist was selected.");
     if (profileConfidence < 0.5) warnings.push("Execution-profile confidence is below 0.50; routed to human review.");
-    if (agentConfidence < 0.6 && mode === "single") warnings.push("Agent confidence is below 0.60; keep this recommendation advisory.");
+    if (workflowConfidence < 0.6) warnings.push("Workflow confidence is below 0.60; keep this recommendation advisory.");
+    if (agentConfidence < 0.6 && mode === "single" && workflow === "single") warnings.push("Agent confidence is below 0.60; keep this recommendation advisory.");
     if (risk === "high") warnings.push("High-risk work requires explicit human approval before execution.");
     if (needsDesktopAccess && profile !== "browser_agent") warnings.push("Desktop access is likely required; verify the selected agent has browser capability.");
 
     return {
       mode,
       profile,
+      workflow,
+      workflowConfidence,
       agent: selected?.name,
       effort,
       effortScore,
@@ -182,7 +208,7 @@ export async function routeSubagentTask(input: {
       riskScore,
       needsDesktopAccess,
       confidence,
-      reason: buildReason(mode, profile, selected?.name, effort, risk),
+      reason: buildReason(mode, profile, workflow, selected?.name, effort, risk),
       source: "jev",
       classifierAvailable: true,
       classifier: modelReference(jev),
@@ -236,7 +262,7 @@ function oversizedTaskDecision(task: string, agents: AgentCandidate[]): RoutingD
     profile: "human",
     risk: "high",
     riskScore: 2,
-    reason: buildReason("human", "human", undefined, decision.effort, "high"),
+    reason: buildReason("human", "human", decision.workflow, undefined, decision.effort, "high"),
     agent: undefined,
     model: undefined,
     thinking: undefined,
@@ -276,6 +302,8 @@ function fallbackDecision(task: string, agents: AgentCandidate[], warning: strin
   return {
     mode,
     profile,
+    workflow: "single",
+    workflowConfidence: confidence,
     agent: selected?.name,
     effort,
     effortScore: effort === "low" ? 0 : effort === "medium" ? 1 : effort === "high" ? 2 : 3,
@@ -283,7 +311,7 @@ function fallbackDecision(task: string, agents: AgentCandidate[], warning: strin
     riskScore: risk === "low" ? 0 : risk === "medium" ? 1 : 2,
     needsDesktopAccess,
     confidence,
-    reason: buildReason(mode, profile, selected?.name, effort, risk),
+    reason: buildReason(mode, profile, "single", selected?.name, effort, risk),
     source: "fallback",
     classifierAvailable: false,
     model: selected?.model,
@@ -370,7 +398,7 @@ function rankProbabilities(answer: ChoiceAnswer | undefined, allowed: Set<string
     .sort((a, b) => b.probability - a.probability || a.agent.localeCompare(b.agent));
 }
 
-function buildReason(mode: RouteMode, profile: AgentProfile, agent: string | undefined, effort: RouteEffort, risk: RouteRisk): string {
+function buildReason(mode: RouteMode, profile: AgentProfile, workflow: WorkflowTemplateId, agent: string | undefined, effort: RouteEffort, risk: RouteRisk): string {
   const target = agent ? `lead specialist '${agent}'` : "no specialist";
-  return `Recommended ${mode} handling through ${profile} with ${target}; estimated effort ${effort} and risk ${risk}.`;
+  return `Recommended ${mode} handling through ${profile} using workflow '${workflow}' with ${target}; estimated effort ${effort} and risk ${risk}.`;
 }
