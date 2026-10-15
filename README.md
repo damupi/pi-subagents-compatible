@@ -48,7 +48,7 @@ Working features include:
 - advisory Jev routing for execution profile, specialist, effort, risk, and desktop access
 - opt-in Jev execution for safe, high-confidence single-agent and controlled workflow routes
 - persistent `/subagents-auto on|off|status` safety switch for Jev automatic execution
-- fixed Jev workflow templates for reconnaissance, implementation, review, and parallel research
+- user-configurable Jev workflows for single-agent, sequential, and parallel execution
 - deterministic fallback recommendations when Jev is unavailable
 - single foreground runs
 - single async/background runs
@@ -81,6 +81,8 @@ package-lock.json
 .gitignore
 overrides.schema.json
 overrides.jsonc.example
+workflows.schema.json
+workflows.jsonc.example
 .github/workflows/ci.yml
 test/harness.ts
 test/index.test.ts
@@ -88,9 +90,10 @@ scripts/build-routing-eval.ts
 runs/
 ```
 
-Local/private runtime file:
+Local/private runtime files:
 
-- `overrides.jsonc` — your real local config (gitignored)
+- `overrides.jsonc` — your real local child runtime policy (gitignored)
+- `workflows.jsonc` — your real local Jev workflow catalog (gitignored)
 
 ## Install / load
 
@@ -148,6 +151,7 @@ This extension uses:
 
 - layered agent directories with scope precedence
 - layered global and project JSONC runtime-policy configs
+- layered global and project JSONC Jev workflow catalogs
 - a run-artifacts directory
 
 Agent resolution precedence is:
@@ -166,7 +170,8 @@ Configurable paths can be overridden with environment variables:
 
 - `PI_SUBAGENT_AGENT_DIR` — optional highest-precedence extra agent directory
 - `PI_SUBAGENT_DATA_DIR` — parent directory for `overrides.jsonc` and `runs/`
-- `PI_SUBAGENT_CONFIG_PATH` — optional config-file override
+- `PI_SUBAGENT_CONFIG_PATH` — optional runtime-policy config-file override
+- `PI_SUBAGENT_WORKFLOWS_PATH` — optional global workflow-catalog override
 - `PI_SUBAGENT_RUNS_DIR` — optional run-directory override
 - `PI_SUBAGENT_RUN_RETENTION_DAYS` — completed and inactive run artifacts are pruned after this many days; defaults to `7`, and `0` disables pruning
 
@@ -213,6 +218,29 @@ To start:
 ```bash
 cp overrides.jsonc.example overrides.jsonc
 ```
+
+### Jev workflow config
+
+Jev workflows are loaded from JSONC outside the installed package, so each user and project can reference its own agents:
+
+1. global catalog: `~/.pi/agent/pi-subagent/workflows.jsonc`
+2. project catalog: `<child-cwd>/.pi/subagent-workflows.jsonc`
+
+Project workflows override global workflows with the same ID. Set `PI_SUBAGENT_WORKFLOWS_PATH` to use another global file. Copy `workflows.jsonc.example` as a starting point:
+
+```bash
+mkdir -p ~/.pi/agent/pi-subagent
+cp workflows.jsonc.example ~/.pi/agent/pi-subagent/workflows.jsonc
+```
+
+Each workflow has a Jev-facing `description`, an execution `mode` (`single`, `chain`, or `parallel`), and one or more agent steps. Use `{{request}}` in a step prompt to insert the original task. A `single` workflow must contain exactly one step.
+
+The IDs `single` and `unclassified` are reserved and cannot be overridden. They are always offered to Jev even when no workflow file exists:
+
+- `single` lets Jev select one enabled specialist.
+- `unclassified` executes nothing and returns control to the parent agent or human.
+
+Invalid workflow entries are ignored, and a malformed optional catalog does not disable routing. Before execution, the extension also verifies that every referenced agent is available. The tracked `workflows.schema.json` provides editor validation.
 
 ## Tool usage
 
@@ -266,19 +294,18 @@ subagent({
 })
 ```
 
-Automatic execution is deliberately narrow. It requires confidence of at least `0.70`, risk below `high`, and enabled agents for one of the fixed templates below. Jev cannot invent an execution graph.
+Automatic execution is deliberately narrow. It requires confidence of at least `0.70`, risk below `high`, and enabled agents for the selected locally configured workflow. Jev selects from the configured catalog but cannot invent an execution graph.
 
-| Template | Execution |
+Two system choices are always available:
+
+| Workflow | Execution |
 |---|---|
-| `single` | Jev-selected specialist |
-| `reconnaissance` | `scout` |
-| `investigate_implement` | `scout → builder` |
-| `implement_review` | `builder → reviewer` |
-| `full_coding` | `planner → builder → reviewer` |
-| `independent_research` | `scout + researcher` in parallel |
+| `single` | Jev-selected enabled specialist |
 | `unclassified` | Do not execute; return control to the parent agent or human |
 
-Templates are optional shortcuts rather than an exhaustive taxonomy. When none clearly fits, Jev selects `unclassified`. For low- or medium-risk work, the parent agent may construct an explicit one-off `{ agent, task }`, `tasks`, or `chain` call. High-risk, ambiguous, or side-effectful work returns to the user for approval. Jev never invents an executable graph.
+The example catalog also contains `reconnaissance`, `investigate_implement`, `implement_review`, `full_coding`, and `independent_research`, but these are examples rather than hardcoded requirements. Users may replace them with workflows that match their own agent roster.
+
+When no configured workflow clearly fits, Jev selects `unclassified`. For low- or medium-risk work, the parent agent may construct an explicit one-off `{ agent, task }`, `tasks`, or `chain` call. High-risk, ambiguous, or side-effectful work returns to the user for approval. Jev never invents an executable graph.
 
 Human and deterministic-script profiles remain with the parent, and `slack-courier` always requires an explicit already-approved send request. If allowed, Jev effort maps to child thinking (`low`, `medium`, `high`, or `max` for `xhigh`) unless the caller supplies an explicit `thinking` override. Automatic chain and parallel templates currently run in foreground only. Blocked routes return the recommendation and reason without launching a child process. The routing decision is persisted in every child run's metadata.
 

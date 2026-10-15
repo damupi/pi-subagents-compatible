@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.pi/extensions/pi-subagent/workflows.schema.json",
+  "title": "Pi subagent Jev workflows",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "workflows": {
+      "type": "object",
+      "description": "Named workflows offered to Jev in addition to the reserved single and unclassified choices.",
+      "maxProperties": 46,
+      "propertyNames": {
+        "allOf": [
+          { "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$" },
+          { "not": { "enum": ["single", "unclassified"] } }
+        ]
+      },
+      "additionalProperties": { "$ref": "#/$defs/workflow" }
+    }
+  },
+  "required": ["workflows"],
+  "$defs": {
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "agent": { "type": "string", "minLength": 1 },
+        "task": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16000,
+          "description": "Prompt for this step. Every {{request}} token is replaced with the original user request."
+        }
+      },
+      "required": ["agent", "task"]
+    },
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 360,
+          "description": "Selection criterion shown to Jev."
+        },
+        "mode": { "enum": ["single", "chain", "parallel"] },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/step" }
+        }
+      },
+      "required": ["description", "mode", "steps"],
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "single" } }, "required": ["mode"] },
+          "then": { "properties": { "steps": { "maxItems": 1 } } }
+        }
+      ]
+    }
+  }
+}

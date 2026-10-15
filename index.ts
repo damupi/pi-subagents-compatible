@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { routeSubagentTask, type RoutingDecision } from "./router.ts";
-import { resolveWorkflowPlan, type WorkflowPlan } from "./workflow-templates.ts";
+import { mergeWorkflowTemplates, normalizeWorkflowTemplates, resolveWorkflowPlan, type WorkflowPlan, type WorkflowTemplates } from "./workflow-templates.ts";
 import { Key, Text, isKeyRelease, isKeyRepeat, matchesKey, stripTerminalSequences, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, rmSync, statSync, writeFileSync, type Dirent } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
@@ -220,8 +220,10 @@ const AUTO_DATA_DIR = existsSync(join(LEGACY_DATA_DIR, "overrides.jsonc")) || ex
 const DATA_DIR = resolveConfiguredPath(process.env.PI_SUBAGENT_DATA_DIR, AUTO_DATA_DIR);
 const ENV_AGENT_DIR = process.env.PI_SUBAGENT_AGENT_DIR?.trim() ? resolve(process.env.PI_SUBAGENT_AGENT_DIR.trim()) : undefined;
 const CONFIG_PATH = resolveConfiguredPath(process.env.PI_SUBAGENT_CONFIG_PATH, join(DATA_DIR, "overrides.jsonc"));
+const WORKFLOW_CONFIG_PATH = resolveConfiguredPath(process.env.PI_SUBAGENT_WORKFLOWS_PATH, join(DATA_DIR, "workflows.jsonc"));
 const AUTO_ROUTING_STATE_PATH = join(DATA_DIR, "auto-routing.json");
 const PROJECT_CONFIG_RELATIVE_PATH = join(".pi", "subagent-overrides.jsonc");
+const PROJECT_WORKFLOW_CONFIG_RELATIVE_PATH = join(".pi", "subagent-workflows.jsonc");
 const SCHEMA_PATH = join(EXTENSION_DIR, "overrides.schema.json");
 const RUNS_DIR = resolveConfiguredPath(process.env.PI_SUBAGENT_RUNS_DIR, join(DATA_DIR, "runs"));
 const DEPTH_ENV = "PI_SUBAGENT_DEPTH";
@@ -556,7 +558,7 @@ export default function (pi: ExtensionAPI) {
         refreshUi(ctx);
         return {
           content: [{ type: "text", text: `Reloaded ${agents.length} subagents.` }],
-          details: { action: "reload", count: agents.length, agentSources: getAgentSourceDirs(currentProjectCwd), configPath: CONFIG_PATH },
+          details: { action: "reload", count: agents.length, agentSources: getAgentSourceDirs(currentProjectCwd), configPath: CONFIG_PATH, workflowConfigPaths: getWorkflowConfigPaths(currentProjectCwd) },
         };
       }
 
@@ -565,7 +567,7 @@ export default function (pi: ExtensionAPI) {
         refreshUi(ctx);
         return {
           content: [{ type: "text", text: renderAgentList(agents, currentProjectCwd).join("\n") }],
-          details: { action: "list", count: agents.length, agents: agents.map(summarizeAgent), agentSources: getAgentSourceDirs(currentProjectCwd), configPath: CONFIG_PATH },
+          details: { action: "list", count: agents.length, agents: agents.map(summarizeAgent), agentSources: getAgentSourceDirs(currentProjectCwd), configPath: CONFIG_PATH, workflowConfigPaths: getWorkflowConfigPaths(currentProjectCwd) },
         };
       }
 
@@ -573,6 +575,7 @@ export default function (pi: ExtensionAPI) {
         if (!input.task?.trim()) return toolError("Missing task. Pass { action: 'route', task }.");
         const runCwd = input.cwd || ctx.cwd;
         const routeAgents = loadAgents(runCwd);
+        const workflows = loadWorkflowTemplates(runCwd);
         const decision = await routeSubagentTask({
           task: input.task,
           agents: routeAgents.map((agent) => ({
@@ -583,10 +586,11 @@ export default function (pi: ExtensionAPI) {
           })),
           ctx,
           signal,
+          workflows,
         });
         return {
           content: [{ type: "text", text: renderRoutingDecision(decision) }],
-          details: { action: "route", task: input.task, cwd: runCwd, decision, executed: false },
+          details: { action: "route", task: input.task, cwd: runCwd, decision, executed: false, workflowConfigPaths: getWorkflowConfigPaths(runCwd) },
           usage: decision.usage,
         };
       }
@@ -697,9 +701,11 @@ export default function (pi: ExtensionAPI) {
       let routingDecision: RoutingDecision | undefined;
       let workflowPlan: WorkflowPlan | undefined;
       let requestedAgent = input.agent;
+      let requestedTask = input.task;
       let requestedThinking = input.thinking;
       if (input.auto) {
         const routeAgents = loadAgents(runCwd);
+        const workflows = loadWorkflowTemplates(runCwd);
         routingDecision = await routeSubagentTask({
           task: input.task,
           agents: routeAgents.map((candidate) => ({
@@ -710,10 +716,11 @@ export default function (pi: ExtensionAPI) {
           })),
           ctx,
           signal,
+          workflows,
         });
         const blocked = autoRouteBlockReason(routingDecision);
         if (blocked) return blockedAutoRouteResult(input.task, runCwd, routingDecision, blocked);
-        const resolvedWorkflow = resolveWorkflowPlan(routingDecision, input.task, new Set(routeAgents.map((candidate) => candidate.runtimeName)));
+        const resolvedWorkflow = resolveWorkflowPlan(routingDecision, input.task, new Set(routeAgents.map((candidate) => candidate.runtimeName)), workflows);
         if (!resolvedWorkflow.plan) {
           return blockedAutoRouteResult(input.task, runCwd, routingDecision, resolvedWorkflow.error || "workflow could not be resolved");
         }
@@ -762,6 +769,7 @@ export default function (pi: ExtensionAPI) {
           };
         }
         requestedAgent = workflowPlan.steps[0]!.agent;
+        requestedTask = workflowPlan.steps[0]!.task;
       }
 
       const agent = resolveAgent(loadAgents(runCwd), requestedAgent || "");
@@ -772,7 +780,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const request: RunRequest = {
-        task: input.task,
+        task: requestedTask,
         model: input.model,
         routingDecision,
         thinking: requestedThinking,
@@ -1126,7 +1134,7 @@ function formatInspectorElapsed(run: InspectorRun): string {
 
 function autoRouteBlockReason(decision: RoutingDecision): string | undefined {
   if (decision.risk === "high") return "high-risk tasks require explicit human approval";
-  if (decision.workflow === "unclassified") return "no reviewed workflow matched; the parent agent or human must choose an explicit one-off workflow";
+  if (decision.workflow === "unclassified") return "no configured workflow matched; the parent agent or human must choose an explicit one-off workflow";
   if (decision.mode === "human" || decision.mode === "main") return `route mode '${decision.mode}' must stay with the parent or a human`;
   if (decision.profile === "human" || decision.profile === "deterministic_script") return `execution profile '${decision.profile}' must stay with the parent or a human`;
   if (decision.workflow === "single" && !decision.agent) return "Jev did not select an enabled specialist";
@@ -1457,6 +1465,25 @@ function loadAgents(projectCwd = process.cwd()): AgentDef[] {
 function getRuntimePolicyPaths(projectCwd = process.cwd()): string[] {
   const projectConfigPath = resolve(projectCwd, PROJECT_CONFIG_RELATIVE_PATH);
   return projectConfigPath === CONFIG_PATH ? [CONFIG_PATH] : [CONFIG_PATH, projectConfigPath];
+}
+
+function getWorkflowConfigPaths(projectCwd = process.cwd()): string[] {
+  const projectConfigPath = resolve(projectCwd, PROJECT_WORKFLOW_CONFIG_RELATIVE_PATH);
+  return projectConfigPath === WORKFLOW_CONFIG_PATH ? [WORKFLOW_CONFIG_PATH] : [WORKFLOW_CONFIG_PATH, projectConfigPath];
+}
+
+function loadWorkflowTemplates(projectCwd = process.cwd()): WorkflowTemplates {
+  let templates: WorkflowTemplates = {};
+  for (const configPath of getWorkflowConfigPaths(projectCwd)) {
+    if (!existsSync(configPath)) continue;
+    try {
+      const parsed = parseJsonc(readFileSync(configPath, "utf8"));
+      templates = mergeWorkflowTemplates(templates, normalizeWorkflowTemplates(parsed.workflows));
+    } catch {
+      // A malformed optional catalog must not disable explicit subagent calls or safe Jev fallback choices.
+    }
+  }
+  return templates;
 }
 
 function loadRuntimePolicy(projectCwd = process.cwd()): RuntimePolicyLayer[] {

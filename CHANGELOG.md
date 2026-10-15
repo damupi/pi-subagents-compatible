@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Load user-defined Jev workflows from global and project JSONC catalogs
+- Ship the former fixed workflows as an editable example instead of requiring a shared agent roster
+- Always preserve the reserved `unclassified` route so control can return to the parent without execution
 - Add persistent `/subagents-auto on|off|status` control for Jev automatic routing
 - Block `auto: true` execution while the global switch is off, while preserving explicit agent, parallel, and chain calls
 - Tell the main agent whether automatic subagent routing is currently enabled

@@ -1,4 +1,4 @@
-import { WORKFLOW_CRITERIA, type WorkflowTemplateId } from "./workflow-templates.ts";
+import { workflowCriteria, type WorkflowTemplates } from "./workflow-templates.ts";
 
 export type AgentCandidate = {
   name: string;
@@ -15,7 +15,7 @@ export type RouteRisk = "low" | "medium" | "high";
 export type RoutingDecision = {
   mode: RouteMode;
   profile: AgentProfile;
-  workflow: WorkflowTemplateId;
+  workflow: string;
   workflowConfidence: number;
   agent?: string;
   effort: RouteEffort;
@@ -66,6 +66,7 @@ export async function routeSubagentTask(input: {
   agents: AgentCandidate[];
   ctx: any;
   signal?: AbortSignal;
+  workflows?: WorkflowTemplates;
 }): Promise<RoutingDecision> {
   const task = input.task.trim();
   if (!task) throw new Error("Routing requires a non-empty task.");
@@ -73,6 +74,8 @@ export async function routeSubagentTask(input: {
   if (input.agents.length === 0) return fallbackDecision(task, [], "No enabled subagents are available.");
 
   const candidates = shortlistAgents(task, input.agents);
+  const configuredWorkflows = input.workflows ?? {};
+  const configuredWorkflowCriteria = workflowCriteria(configuredWorkflows);
   const registry = input.ctx?.modelRegistry;
   const jev = await findAvailableJev(registry);
   if (!jev || typeof registry?.classify !== "function") {
@@ -107,7 +110,7 @@ export async function routeSubagentTask(input: {
           workflow: {
             type: "choice",
             instructions: "Choose the smallest approved workflow that can complete the task reliably. Do not invent another workflow.",
-            criteria: WORKFLOW_CRITERIA,
+            criteria: configuredWorkflowCriteria,
           },
           effort: {
             type: "score",
@@ -161,7 +164,7 @@ export async function routeSubagentTask(input: {
       : probabilityFor(profileAnswer, rawProfile);
     const profile: AgentProfile = profileConfidence < 0.5 ? "human" : rawProfile;
     const workflowAnswer = result.answers?.workflow as ChoiceAnswer | undefined;
-    const workflow = choice(workflowAnswer, ["single", "reconnaissance", "investigate_implement", "implement_review", "full_coding", "independent_research", "unclassified"] as const, "unclassified");
+    const workflow = choice(workflowAnswer, Object.keys(configuredWorkflowCriteria), "unclassified");
     const workflowConfidence = typeof workflowAnswer?.confidence === "number"
       ? workflowAnswer.confidence
       : probabilityFor(workflowAnswer, workflow);
@@ -173,13 +176,10 @@ export async function routeSubagentTask(input: {
     const rankedAgents = rankProbabilities(result.answers?.agent as ChoiceAnswer | undefined, new Set(candidates.map((agent) => agent.name)));
     const selected = candidates.find((agent) => agent.name === rankedAgents[0]?.agent);
     const agentConfidence = selected ? rankedAgents[0]?.probability ?? 0 : 0;
+    const configuredMode = configuredWorkflows[workflow]?.mode;
     const workflowMode: RouteMode = workflow === "unclassified"
       ? "main"
-      : workflow === "independent_research"
-        ? "parallel"
-        : workflow === "investigate_implement" || workflow === "implement_review" || workflow === "full_coding"
-          ? "chain"
-          : "single";
+      : configuredMode ?? "single";
     const confidence = Math.min(
       profileConfidence,
       workflowConfidence || profileConfidence,
@@ -401,7 +401,7 @@ function rankProbabilities(answer: ChoiceAnswer | undefined, allowed: Set<string
     .sort((a, b) => b.probability - a.probability || a.agent.localeCompare(b.agent));
 }
 
-function buildReason(mode: RouteMode, profile: AgentProfile, workflow: WorkflowTemplateId, agent: string | undefined, effort: RouteEffort, risk: RouteRisk): string {
+function buildReason(mode: RouteMode, profile: AgentProfile, workflow: string, agent: string | undefined, effort: RouteEffort, risk: RouteRisk): string {
   const target = agent ? `lead specialist '${agent}'` : "no specialist";
   return `Recommended ${mode} handling through ${profile} using workflow '${workflow}' with ${target}; estimated effort ${effort} and risk ${risk}.`;
 }

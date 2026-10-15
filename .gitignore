@@ -1,5 +1,6 @@
 node_modules/
 overrides.jsonc
+workflows.jsonc
 runs/
 .pi-subagent-evals/
 *.local.jsonl
