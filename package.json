@@ -34,6 +34,8 @@
     "LICENSE",
     "overrides.schema.json",
     "overrides.jsonc.example",
+    "workflows.schema.json",
+    "workflows.jsonc.example",
     "scripts/build-routing-eval.ts"
   ],
   "peerDependencies": {

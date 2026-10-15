@@ -36,9 +36,41 @@ export async function createHarness(options: { retentionDays?: number; dataPathM
 
   writeFileSync(join(agentsDir, "test-agent.md"), `---\nname: test-agent\ndescription: Hermetic test agent\n---\n\nYou are a test agent.\n`);
   const globalConfigPath = join(dataDir, "overrides.jsonc");
+  const workflowConfigPath = join(dataDir, "workflows.jsonc");
   writeFileSync(globalConfigPath, JSON.stringify({
     defaults: { timeoutMs: 5000, tools: ["Read"], inheritSkills: false },
     agentOverrides: { "test-agent": { thinking: "low" } },
+  }, null, 2));
+  writeFileSync(workflowConfigPath, JSON.stringify({
+    workflows: {
+      full_coding: {
+        description: "Plan, implement, and review",
+        mode: "chain",
+        steps: [
+          { agent: "planner", task: "Plan this request.\\n\\n{{request}}" },
+          { agent: "builder", task: "Implement this request using the upstream plan.\\n\\n{{request}}" },
+          { agent: "reviewer", task: "Review this request using the upstream handoff.\\n\\n{{request}}" },
+        ],
+      },
+      independent_research: {
+        description: "Research independent local and documentation angles",
+        mode: "parallel",
+        steps: [
+          { agent: "scout", task: "PARALLEL ONE {{request}}" },
+          { agent: "researcher", task: "PARALLEL TWO {{request}}" },
+        ],
+      },
+      custom_test_workflow: {
+        description: "Use the test agent with a configured prompt",
+        mode: "single",
+        steps: [{ agent: "test-agent", task: "CUSTOM WORKFLOW {{request}}" }],
+      },
+      unclassified: {
+        description: "This reserved workflow must never be overridden",
+        mode: "single",
+        steps: [{ agent: "test-agent", task: "MUST NOT RUN" }],
+      },
+    },
   }, null, 2));
   writeFileSync(join(projectDir, ".pi", "subagent-overrides.jsonc"), JSON.stringify({
     defaults: { tools: ["Bash"] },
@@ -101,9 +133,11 @@ if (task.includes("SLEEP_IGNORE_TERM")) {
   process.env.PI_SUBAGENT_AGENT_DIR = agentsDir;
   if (dataPathMode === "explicit") {
     process.env.PI_SUBAGENT_CONFIG_PATH = globalConfigPath;
+    process.env.PI_SUBAGENT_WORKFLOWS_PATH = workflowConfigPath;
     process.env.PI_SUBAGENT_RUNS_DIR = runsDir;
   } else {
     delete process.env.PI_SUBAGENT_CONFIG_PATH;
+    delete process.env.PI_SUBAGENT_WORKFLOWS_PATH;
     delete process.env.PI_SUBAGENT_RUNS_DIR;
   }
   if (dataPathMode === "data-env") process.env.PI_SUBAGENT_DATA_DIR = dataDir;
@@ -232,6 +266,7 @@ if (task.includes("SLEEP_IGNORE_TERM")) {
     root,
     dataDir,
     globalConfigPath,
+    workflowConfigPath,
     runsDir,
     projectDir,
     markersDir,

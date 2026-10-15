@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { after, before, test } from "node:test";
-import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { createHarness, isProcessAlive, waitFor } from "./harness.ts";
@@ -67,6 +67,9 @@ test("route action uses Jev for advisory profile, effort, risk, desktop, and age
   assert.equal(classifierContext.state.agents.length, 2);
   assert.ok(classifierContext.questions.agent.criteria["long-agent"].length <= 360);
   assert.equal(classifierContext.questions.workflow.type, "choice");
+  assert.equal(classifierContext.questions.workflow.criteria.custom_test_workflow, "Use the test agent with a configured prompt");
+  assert.match(classifierContext.questions.workflow.criteria.unclassified, /return control to the parent agent/);
+  assert.doesNotMatch(classifierContext.questions.workflow.criteria.unclassified, /must never be overridden/i);
   assert.equal(classifierContext.questions.effort.type, "score");
   assert.equal(classifierContext.questions.needs_desktop.type, "bool");
   assert.match(result.content[0].text, /not executed/);
@@ -200,7 +203,59 @@ test("auto routing returns unclassified workflows to the main agent without exec
   delete harness.ctx.modelRegistry;
 });
 
-test("auto routing executes the approved full-coding chain template", async () => {
+test("auto routing executes a project workflow override", async () => {
+  const tool = harness.tools.get("subagent");
+  assert.ok(tool);
+  const projectWorkflowPath = join(harness.projectDir, ".pi", "subagent-workflows.jsonc");
+  writeFileSync(projectWorkflowPath, JSON.stringify({
+    workflows: {
+      custom_test_workflow: {
+        description: "Project-specific test workflow",
+        mode: "single",
+        steps: [{ agent: "test-agent", task: "PROJECT WORKFLOW {{request}}" }],
+      },
+    },
+  }));
+  harness.ctx.modelRegistry = {
+    async getAvailableOfType() {
+      return [{ type: "classifier", provider: "openrouter", id: "~typesafe/jev-latest" }];
+    },
+    async classify(_model: any, context: any) {
+      assert.equal(context.questions.workflow.criteria.custom_test_workflow, "Project-specific test workflow");
+      return {
+        stopReason: "stop",
+        answers: {
+          profile: { type: "choice", choice: "fast_agent", confidence: 0.94, probabilities: { fast_agent: 0.94, reasoning_agent: 0.06 } },
+          workflow: { type: "choice", choice: "custom_test_workflow", confidence: 0.92, probabilities: { custom_test_workflow: 0.92, unclassified: 0.08 } },
+          effort: { type: "score", score: 1.1, confidence: 0.90 },
+          risk: { type: "score", score: 0.2, confidence: 0.93 },
+          needs_desktop: { type: "bool", probability: 0.02 },
+          agent: { type: "choice", choice: "test-agent", confidence: 0.90, probabilities: { "test-agent": 0.90 } },
+        },
+      };
+    },
+  };
+
+  try {
+    const result = await tool.execute("auto-custom-workflow", {
+      auto: true,
+      task: "Inspect the configured workflow",
+      cwd: harness.projectDir,
+    }, undefined, undefined, harness.ctx);
+
+    assert.equal(result.isError, false);
+    assert.equal(result.details.agent, "test-agent");
+    assert.equal(result.details.routing.workflow, "custom_test_workflow");
+    const record = harness.records().find((item) => item.task === "PROJECT WORKFLOW Inspect the configured workflow");
+    assert.ok(record);
+    assert.equal(record.routingDecision.workflow, "custom_test_workflow");
+  } finally {
+    delete harness.ctx.modelRegistry;
+    rmSync(projectWorkflowPath, { force: true });
+  }
+});
+
+test("auto routing executes the configured full-coding chain template", async () => {
   const tool = harness.tools.get("subagent");
   assert.ok(tool);
   for (const name of ["planner", "builder", "reviewer"]) {
@@ -244,7 +299,7 @@ test("auto routing executes the approved full-coding chain template", async () =
   delete harness.ctx.modelRegistry;
 });
 
-test("auto routing executes the approved independent-research parallel template", async () => {
+test("auto routing executes the configured independent-research parallel template", async () => {
   const tool = harness.tools.get("subagent");
   assert.ok(tool);
   for (const name of ["scout", "researcher"]) {

@@ -1,0 +1,79 @@
+{
+  "$schema": "./workflows.schema.json",
+
+  // Jev always also receives two system choices that cannot be overridden:
+  // - single: choose one available specialist
+  // - unclassified: return control to the parent agent without executing
+  "workflows": {
+    "reconnaissance": {
+      "description": "A Scout-only repository reconnaissance or architecture-mapping task",
+      "mode": "single",
+      "steps": [
+        {
+          "agent": "scout",
+          "task": "{{request}}"
+        }
+      ]
+    },
+    "investigate_implement": {
+      "description": "Scout must locate the relevant code before Builder implements the change",
+      "mode": "chain",
+      "steps": [
+        {
+          "agent": "scout",
+          "task": "Map the relevant files, dependencies, tests, and likely change areas for this request. Do not implement.\n\nRequest:\n{{request}}"
+        },
+        {
+          "agent": "builder",
+          "task": "Implement and validate this request using the upstream Scout handoff.\n\nRequest:\n{{request}}"
+        }
+      ]
+    },
+    "implement_review": {
+      "description": "Builder should implement a defined change and Reviewer should validate it",
+      "mode": "chain",
+      "steps": [
+        {
+          "agent": "builder",
+          "task": "Implement and validate this request.\n\nRequest:\n{{request}}"
+        },
+        {
+          "agent": "reviewer",
+          "task": "Review the implementation for correctness, regressions, and missing validation using the upstream handoff. Do not modify files.\n\nRequest:\n{{request}}"
+        }
+      ]
+    },
+    "full_coding": {
+      "description": "The task needs explicit planning, implementation, and independent review",
+      "mode": "chain",
+      "steps": [
+        {
+          "agent": "planner",
+          "task": "Produce a concrete implementation plan, risks, and validation steps for this request. Do not implement.\n\nRequest:\n{{request}}"
+        },
+        {
+          "agent": "builder",
+          "task": "Implement and validate this request using the upstream plan.\n\nRequest:\n{{request}}"
+        },
+        {
+          "agent": "reviewer",
+          "task": "Review the implementation for correctness, regressions, and missing validation using the upstream handoff. Do not modify files.\n\nRequest:\n{{request}}"
+        }
+      ]
+    },
+    "independent_research": {
+      "description": "Scout and Researcher should investigate independent angles in parallel",
+      "mode": "parallel",
+      "steps": [
+        {
+          "agent": "scout",
+          "task": "Investigate the repository and local-code angle of this request. Return exact files and evidence.\n\nRequest:\n{{request}}"
+        },
+        {
+          "agent": "researcher",
+          "task": "Investigate an independent research and documentation angle of this request. Return sources and evidence.\n\nRequest:\n{{request}}"
+        }
+      ]
+    }
+  }
+}
